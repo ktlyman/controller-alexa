@@ -394,13 +394,12 @@ export class AlexaAgentTool {
     // Set on the API client
     this.alexaApi.setCredentials(credentials);
 
-    // Validate the cookie
+    // Validate the cookie (best-effort; the bootstrap endpoint can be flaky)
     const valid = await this.alexaApi.validateCookie();
 
-    // Store if valid
-    if (valid) {
-      await this.cookieStore.set(this.userId, this.alexaApi.getCredentials()!);
-    }
+    // Always persist — the cookie may still work for device APIs even if
+    // the bootstrap endpoint returns a non-2xx status.
+    await this.cookieStore.set(this.userId, this.alexaApi.getCredentials()!);
 
     await this.eventLogger.logCustomEvent({
       eventType: 'AgentSetAlexaCookie',
@@ -410,7 +409,7 @@ export class AlexaAgentTool {
       tags: ['agent_action', 'auth'],
     });
 
-    return { stored: valid, valid };
+    return { stored: true, valid };
   }
 
   private async listAllDevices(

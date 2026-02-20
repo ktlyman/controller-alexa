@@ -197,9 +197,14 @@ export class AlexaApiClient {
     if (!this.credentials?.cookie) return false;
 
     try {
+      // Try bootstrap first, fall back to devices endpoint
       const response = await this.request('GET', '/api/bootstrap');
-      // 200 or 2xx = valid; 302/401/403 = expired
-      return response.statusCode >= 200 && response.statusCode < 300;
+      if (response.statusCode >= 200 && response.statusCode < 300) return true;
+
+      // Bootstrap can redirect or 4xx even with valid cookies;
+      // try the devices endpoint as a secondary check.
+      const fallback = await this.request('GET', '/api/devices/device');
+      return fallback.statusCode >= 200 && fallback.statusCode < 300;
     } catch {
       return false;
     }

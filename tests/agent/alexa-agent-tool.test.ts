@@ -272,9 +272,9 @@ describe('AlexaAgentTool', () => {
   });
 
   describe('set_alexa_cookie', () => {
-    it('should fail validation with invalid cookie (no network)', async () => {
+    it('should store cookie even when validation fails (no network)', async () => {
       // validateCookie will fail because there's no real server
-      // but the action itself should not throw — it returns success:true with valid:false
+      // but the cookie should still be stored for later use
       const result = await tool.execute({
         type: 'set_alexa_cookie',
         cookie: 'session-id=fake; csrf=fake-token',
@@ -282,7 +282,7 @@ describe('AlexaAgentTool', () => {
       });
       expect(result.success).toBe(true);
       expect((result.data as any).valid).toBe(false);
-      expect((result.data as any).stored).toBe(false);
+      expect((result.data as any).stored).toBe(true);
     });
 
     it('should log auth event', async () => {
