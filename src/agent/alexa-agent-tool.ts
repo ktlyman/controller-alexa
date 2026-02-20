@@ -24,6 +24,9 @@ import { EventLogger, EventGatewayClient, InMemoryEventStore } from '../events';
 import type { EventStore } from '../events';
 import type { RoutineStore } from '../routines/routine-store';
 import type { TokenStore } from '../auth/token-store';
+import { AlexaApiClient, InMemoryCookieStore } from '../alexa-api';
+import type { CookieStore } from '../alexa-api';
+import type { AlexaCookieCredentials, AlexaApiRegion, AccountDeviceCommand } from '../alexa-api';
 import type {
   AgentAction,
   AgentToolResult,
@@ -36,6 +39,9 @@ import type {
   DeleteRoutineResult,
   QueryEventsResult,
   GetEventStreamResult,
+  SetAlexaCookieResult,
+  ListAllDevicesResult,
+  ControlAccountDeviceResult,
 } from '../types/agent';
 
 export class AlexaAgentTool {
@@ -46,6 +52,8 @@ export class AlexaAgentTool {
   private routines: RoutineManager;
   private eventLogger: EventLogger;
   private eventGateway: EventGatewayClient;
+  private alexaApi: AlexaApiClient;
+  private cookieStore: CookieStore;
   private cleanup?: () => void;
 
   /** The user ID for the current session. */
@@ -58,6 +66,7 @@ export class AlexaAgentTool {
     eventStore?: EventStore;
     routineStore?: RoutineStore;
     tokenStore?: TokenStore;
+    cookieStore?: CookieStore;
   }) {
     this.config = loadConfig(opts?.config);
     this.userId = opts?.userId ?? 'default-user';
@@ -65,9 +74,10 @@ export class AlexaAgentTool {
     let eventStore = opts?.eventStore;
     let routineStore = opts?.routineStore;
     let tokenStore = opts?.tokenStore;
+    let cookieStore = opts?.cookieStore;
 
     // Auto-create SQLite stores when configured and no override provided
-    if (this.config.storageBackend === 'sqlite' && (!eventStore || !routineStore || !tokenStore)) {
+    if (this.config.storageBackend === 'sqlite' && (!eventStore || !routineStore || !tokenStore || !cookieStore)) {
       // Lazy-require to avoid breaking environments without native module
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { SqliteStorage } = require('../storage/sqlite') as typeof import('../storage/sqlite');
@@ -75,6 +85,7 @@ export class AlexaAgentTool {
       eventStore = eventStore ?? storage.events();
       routineStore = routineStore ?? storage.routines();
       tokenStore = tokenStore ?? storage.tokens();
+      cookieStore = cookieStore ?? storage.cookies();
       this.cleanup = () => storage.close();
     }
 
@@ -84,6 +95,8 @@ export class AlexaAgentTool {
     this.routines = new RoutineManager(this.config, routineStore ?? new InMemoryRoutineStore());
     this.eventLogger = new EventLogger(eventStore ?? new InMemoryEventStore(this.config.maxInMemoryEvents));
     this.eventGateway = new EventGatewayClient(this.config.region);
+    this.cookieStore = cookieStore ?? new InMemoryCookieStore();
+    this.alexaApi = new AlexaApiClient(this.config.region as AlexaApiRegion);
   }
 
   /**
@@ -104,6 +117,7 @@ export class AlexaAgentTool {
   getRoutineManager(): RoutineManager { return this.routines; }
   getEventLogger(): EventLogger { return this.eventLogger; }
   getEventGateway(): EventGatewayClient { return this.eventGateway; }
+  getAlexaApiClient(): AlexaApiClient { return this.alexaApi; }
 
   // -----------------------------------------------------------------------
   // Main dispatch
@@ -148,6 +162,15 @@ export class AlexaAgentTool {
           break;
         case 'get_event_stream':
           data = await this.getEventStream(action.endpointIds);
+          break;
+        case 'set_alexa_cookie':
+          data = await this.setAlexaCookie(action.cookie, action.csrf);
+          break;
+        case 'list_all_devices':
+          data = await this.listAllDevices(action.source, action.deviceType);
+          break;
+        case 'control_account_device':
+          data = await this.controlAccountDevice(action.deviceId, action.deviceType, action.command);
           break;
         default: {
           const _exhaustive: never = action;
@@ -352,5 +375,111 @@ export class AlexaAgentTool {
     }, endpointIds);
 
     return { streamId, status: 'subscribed' };
+  }
+
+  // -----------------------------------------------------------------------
+  // Unofficial API actions (cookie-based, all-account)
+  // -----------------------------------------------------------------------
+
+  private async setAlexaCookie(
+    cookie: string,
+    csrf?: string,
+  ): Promise<SetAlexaCookieResult> {
+    const credentials: AlexaCookieCredentials = {
+      cookie,
+      csrf,
+      storedAt: new Date().toISOString(),
+    };
+
+    // Set on the API client
+    this.alexaApi.setCredentials(credentials);
+
+    // Validate the cookie
+    const valid = await this.alexaApi.validateCookie();
+
+    // Store if valid
+    if (valid) {
+      await this.cookieStore.set(this.userId, this.alexaApi.getCredentials()!);
+    }
+
+    await this.eventLogger.logCustomEvent({
+      eventType: 'AgentSetAlexaCookie',
+      namespace: 'AlexaAgentTool',
+      userId: this.userId,
+      payload: { valid, hasCSRF: !!csrf },
+      tags: ['agent_action', 'auth'],
+    });
+
+    return { stored: valid, valid };
+  }
+
+  private async listAllDevices(
+    source?: 'smart_home' | 'echo' | 'all',
+    deviceType?: string,
+  ): Promise<ListAllDevicesResult> {
+    await this.ensureCookieLoaded();
+
+    let devices = await this.alexaApi.getAllDevices();
+
+    // Apply source filter
+    if (source && source !== 'all') {
+      devices = devices.filter((d) => d.source === source);
+    }
+
+    // Apply device type filter
+    if (deviceType) {
+      devices = devices.filter(
+        (d) => d.deviceType.toUpperCase() === deviceType.toUpperCase(),
+      );
+    }
+
+    await this.eventLogger.logCustomEvent({
+      eventType: 'AgentListAllDevices',
+      namespace: 'AlexaAgentTool',
+      userId: this.userId,
+      payload: { source, deviceType, deviceCount: devices.length },
+      tags: ['agent_action', 'discovery', 'account_api'],
+    });
+
+    return { devices, deviceCount: devices.length };
+  }
+
+  private async controlAccountDevice(
+    deviceId: string,
+    deviceType: string,
+    command: AccountDeviceCommand,
+  ): Promise<ControlAccountDeviceResult> {
+    await this.ensureCookieLoaded();
+
+    await this.alexaApi.sendCommand({ deviceId, deviceType, command });
+
+    await this.eventLogger.logCustomEvent({
+      eventType: 'AgentControlAccountDevice',
+      namespace: 'AlexaAgentTool',
+      endpointId: deviceId,
+      userId: this.userId,
+      payload: { command },
+      tags: ['agent_action', 'device_control', 'account_api'],
+    });
+
+    return { acknowledged: true };
+  }
+
+  /**
+   * Ensure the AlexaApiClient has credentials loaded.
+   * If not already set on the client, try loading from the cookie store.
+   */
+  private async ensureCookieLoaded(): Promise<void> {
+    if (this.alexaApi.hasValidCredentials()) return;
+
+    const stored = await this.cookieStore.get(this.userId);
+    if (!stored) {
+      throw new Error(
+        'No Alexa cookie configured. Use the set_alexa_cookie action first. ' +
+        'Extract your cookie from browser dev tools at alexa.amazon.com.',
+      );
+    }
+
+    this.alexaApi.setCredentials(stored);
   }
 }

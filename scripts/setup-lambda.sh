@@ -23,6 +23,13 @@
 
 set -euo pipefail
 
+# Load .env if present (for ALEXA_SKILL_ID)
+if [ -f "$(dirname "$(cd "$(dirname "$0")" && pwd)")/.env" ]; then
+  set -a
+  source "$(dirname "$(cd "$(dirname "$0")" && pwd)")/.env"
+  set +a
+fi
+
 FUNCTION_NAME="alexa-agent-proxy"
 ROLE_NAME="alexa-agent-proxy-role"
 REGION="${AWS_REGION:-us-east-1}"
@@ -32,6 +39,8 @@ TIMEOUT=8
 MEMORY=128
 
 FORWARD_URL="${1:-}"
+SKILL_ID="${ALEXA_SKILL_ID:-}"
+
 if [ -z "$FORWARD_URL" ]; then
   echo "Usage: $0 <FORWARD_URL>"
   echo ""
@@ -133,13 +142,17 @@ fi
 # -----------------------------------------------------------------------
 
 echo "==> Adding Alexa trigger permission (idempotent)..."
-aws lambda add-permission \
-  --function-name "$FUNCTION_NAME" \
-  --region "$REGION" \
-  --statement-id "alexa-smart-home" \
-  --action "lambda:InvokeFunction" \
-  --principal "alexa-connectedhome.amazon.com" \
-  2>/dev/null || true
+PERMISSION_ARGS=(
+  --function-name "$FUNCTION_NAME"
+  --region "$REGION"
+  --statement-id "alexa-smart-home"
+  --action "lambda:InvokeFunction"
+  --principal "alexa-connectedhome.amazon.com"
+)
+if [ -n "$SKILL_ID" ]; then
+  PERMISSION_ARGS+=(--event-source-token "$SKILL_ID")
+fi
+aws lambda add-permission "${PERMISSION_ARGS[@]}" 2>/dev/null || true
 
 # -----------------------------------------------------------------------
 # Cleanup

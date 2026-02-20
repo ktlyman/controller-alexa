@@ -1,1 +1,1 @@
-export { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore } from './sqlite';
+export { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore, SqliteCookieStore } from './sqlite';

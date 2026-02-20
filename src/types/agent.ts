@@ -14,6 +14,7 @@ import type {
   Color,
   ThermostatMode,
 } from './alexa';
+import type { AccountDevice, AccountDeviceCommand } from '../alexa-api/alexa-api-types';
 import type { StoredEvent, EventQuery } from '../events/event-store';
 
 // ---------------------------------------------------------------------------
@@ -29,7 +30,10 @@ export type AgentAction =
   | CreateRoutineAction
   | DeleteRoutineAction
   | QueryEventsAction
-  | GetEventStreamAction;
+  | GetEventStreamAction
+  | SetAlexaCookieAction
+  | ListAllDevicesAction
+  | ControlAccountDeviceAction;
 
 // -- Device actions ---------------------------------------------------------
 
@@ -104,6 +108,34 @@ export interface RoutineActionStep {
   delaySeconds?: number;
 }
 
+// -- Unofficial API actions (cookie-based, all-account) --------------------
+
+export interface SetAlexaCookieAction {
+  type: 'set_alexa_cookie';
+  /** Full cookie string from browser dev tools */
+  cookie: string;
+  /** Optional CSRF token (auto-extracted from cookie if omitted) */
+  csrf?: string;
+}
+
+export interface ListAllDevicesAction {
+  type: 'list_all_devices';
+  /** Filter by source: 'smart_home', 'echo', or 'all' (default) */
+  source?: 'smart_home' | 'echo' | 'all';
+  /** Filter by device type string (e.g., 'LIGHT', 'ECHO') */
+  deviceType?: string;
+}
+
+export interface ControlAccountDeviceAction {
+  type: 'control_account_device';
+  /** The device ID (entityId or serialNumber) */
+  deviceId: string;
+  /** The device type (needed for the behaviors API) */
+  deviceType: string;
+  /** The command to execute */
+  command: AccountDeviceCommand;
+}
+
 // -- Event actions ----------------------------------------------------------
 
 export interface QueryEventsAction {
@@ -142,6 +174,9 @@ export type CreateRoutineResult = { routineId: string };
 export type DeleteRoutineResult = { deleted: boolean };
 export type QueryEventsResult = { events: StoredEvent[]; totalCount: number; cursor?: string };
 export type GetEventStreamResult = { streamId: string; status: 'subscribed' };
+export type SetAlexaCookieResult = { stored: boolean; valid: boolean };
+export type ListAllDevicesResult = { devices: AccountDevice[]; deviceCount: number };
+export type ControlAccountDeviceResult = { acknowledged: boolean };
 
 export interface RoutineSummary {
   id: string;

@@ -1,9 +1,10 @@
 import path from 'path';
 import fs from 'fs';
-import { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore } from '../../src/storage/sqlite';
+import { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore, SqliteCookieStore } from '../../src/storage/sqlite';
 import type { StoredEvent } from '../../src/events/event-store';
 import type { StoredRoutine } from '../../src/routines/routine-store';
 import type { TokenPair } from '../../src/auth/token-store';
+import type { AlexaCookieCredentials } from '../../src/alexa-api/alexa-api-types';
 
 const TEST_DB = path.join(__dirname, '..', 'test-storage.db');
 
@@ -291,6 +292,86 @@ describe('SqliteTokenStore', () => {
     const retrieved = await store2.get('user-1');
     expect(retrieved).not.toBeNull();
     expect(retrieved!.accessToken).toBe('Atza|test-access');
+    storage2.close();
+  });
+});
+
+describe('SqliteCookieStore', () => {
+  let storage: SqliteStorage;
+  let store: SqliteCookieStore;
+
+  beforeEach(() => {
+    try { fs.unlinkSync(TEST_DB); } catch {}
+    storage = new SqliteStorage(TEST_DB);
+    store = storage.cookies();
+  });
+
+  afterEach(() => {
+    storage.close();
+    try { fs.unlinkSync(TEST_DB); } catch {}
+  });
+
+  const sampleCreds: AlexaCookieCredentials = {
+    cookie: 'session-id=abc123; csrf=token456',
+    csrf: 'token456',
+    storedAt: '2026-01-15T10:00:00.000Z',
+  };
+
+  it('should return null for missing user', async () => {
+    expect(await store.get('nonexistent')).toBeNull();
+  });
+
+  it('should store and retrieve cookie credentials', async () => {
+    await store.set('user-1', sampleCreds);
+    const retrieved = await store.get('user-1');
+    expect(retrieved).not.toBeNull();
+    expect(retrieved!.cookie).toBe('session-id=abc123; csrf=token456');
+    expect(retrieved!.csrf).toBe('token456');
+    expect(retrieved!.storedAt).toBe('2026-01-15T10:00:00.000Z');
+  });
+
+  it('should handle optional fields', async () => {
+    const minimal: AlexaCookieCredentials = {
+      cookie: 'minimal-cookie',
+      storedAt: '2026-01-15T10:00:00.000Z',
+    };
+    await store.set('user-1', minimal);
+    const retrieved = await store.get('user-1');
+    expect(retrieved!.cookie).toBe('minimal-cookie');
+    expect(retrieved!.csrf).toBeUndefined();
+    expect(retrieved!.expiresAt).toBeUndefined();
+  });
+
+  it('should upsert on conflict', async () => {
+    await store.set('user-1', sampleCreds);
+    const updated: AlexaCookieCredentials = {
+      cookie: 'new-cookie',
+      csrf: 'new-csrf',
+      storedAt: '2026-02-01T00:00:00.000Z',
+      expiresAt: '2026-02-15T00:00:00.000Z',
+    };
+    await store.set('user-1', updated);
+    const retrieved = await store.get('user-1');
+    expect(retrieved!.cookie).toBe('new-cookie');
+    expect(retrieved!.csrf).toBe('new-csrf');
+    expect(retrieved!.expiresAt).toBe('2026-02-15T00:00:00.000Z');
+  });
+
+  it('should delete cookie credentials', async () => {
+    await store.set('user-1', sampleCreds);
+    await store.delete('user-1');
+    expect(await store.get('user-1')).toBeNull();
+  });
+
+  it('should persist across reopen', async () => {
+    await store.set('user-1', sampleCreds);
+    storage.close();
+
+    const storage2 = new SqliteStorage(TEST_DB);
+    const store2 = storage2.cookies();
+    const retrieved = await store2.get('user-1');
+    expect(retrieved).not.toBeNull();
+    expect(retrieved!.cookie).toBe('session-id=abc123; csrf=token456');
     storage2.close();
   });
 });

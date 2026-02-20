@@ -1,5 +1,6 @@
 import { AlexaAgentTool } from '../../src/agent';
 import { InMemoryEventStore } from '../../src/events';
+import { InMemoryCookieStore } from '../../src/alexa-api/cookie-store';
 import type { AgentAction } from '../../src/types/agent';
 
 describe('AlexaAgentTool', () => {
@@ -263,6 +264,57 @@ describe('AlexaAgentTool', () => {
 
     it('should expose event gateway', () => {
       expect(tool.getEventGateway()).toBeDefined();
+    });
+
+    it('should expose alexa API client', () => {
+      expect(tool.getAlexaApiClient()).toBeDefined();
+    });
+  });
+
+  describe('set_alexa_cookie', () => {
+    it('should fail validation with invalid cookie (no network)', async () => {
+      // validateCookie will fail because there's no real server
+      // but the action itself should not throw — it returns success:true with valid:false
+      const result = await tool.execute({
+        type: 'set_alexa_cookie',
+        cookie: 'session-id=fake; csrf=fake-token',
+        csrf: 'fake-token',
+      });
+      expect(result.success).toBe(true);
+      expect((result.data as any).valid).toBe(false);
+      expect((result.data as any).stored).toBe(false);
+    });
+
+    it('should log auth event', async () => {
+      await tool.execute({
+        type: 'set_alexa_cookie',
+        cookie: 'test-cookie',
+      });
+
+      const events = await eventStore.query({ eventType: 'AgentSetAlexaCookie' });
+      expect(events.events).toHaveLength(1);
+      expect(events.events[0].tags).toContain('auth');
+    });
+  });
+
+  describe('list_all_devices', () => {
+    it('should fail without cookie configured', async () => {
+      const result = await tool.execute({ type: 'list_all_devices' });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('No Alexa cookie configured');
+    });
+  });
+
+  describe('control_account_device', () => {
+    it('should fail without cookie configured', async () => {
+      const result = await tool.execute({
+        type: 'control_account_device',
+        deviceId: 'dev-1',
+        deviceType: 'LIGHT',
+        command: { action: 'turn_on' },
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('No Alexa cookie configured');
     });
   });
 });

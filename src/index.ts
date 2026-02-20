@@ -25,7 +25,11 @@ export type { EventStore, StoredEvent, EventQuery, EventQueryResult, EventListen
 export { createHandler } from './lambda';
 export type { LambdaContext } from './lambda';
 
-export { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore } from './storage';
+export { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore, SqliteCookieStore } from './storage';
+
+// Unofficial Alexa API
+export { AlexaApiClient, InMemoryCookieStore } from './alexa-api';
+export type { CookieStore, AlexaCookieCredentials, AccountDevice, AccountDeviceCommand, AlexaApiRegion } from './alexa-api';
 
 export { loadConfig } from './config';
 export type { AlexaAgentConfig } from './config';
@@ -63,4 +67,10 @@ export type {
   RoutineTrigger,
   RoutineActionStep,
   RoutineSummary,
+  SetAlexaCookieAction,
+  ListAllDevicesAction,
+  ControlAccountDeviceAction,
+  SetAlexaCookieResult,
+  ListAllDevicesResult,
+  ControlAccountDeviceResult,
 } from './types/agent';

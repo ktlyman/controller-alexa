@@ -37,6 +37,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Cookie status (unofficial API auth)
+  if (req.method === 'GET' && req.url === '/cookie-status') {
+    const hasCookie = tool.getAlexaApiClient().hasValidCredentials();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ hasCookie }));
+    return;
+  }
+
   // Alexa directive endpoint — the Lambda proxy POSTs here
   if (req.method === 'POST' && req.url === '/directive') {
     let body = '';
@@ -87,6 +95,7 @@ server.listen(port, () => {
   console.log(`    POST /directive  — receives forwarded Alexa directives`);
   console.log(`    POST /action     — receives agent tool actions`);
   console.log(`    GET  /health     — health check`);
+  console.log(`    GET  /cookie-status — unofficial API cookie status`);
 });
 
 // Graceful shutdown

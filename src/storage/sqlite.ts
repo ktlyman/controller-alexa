@@ -9,6 +9,8 @@ import Database from 'better-sqlite3';
 import type { EventStore, StoredEvent, EventQuery, EventQueryResult } from '../events/event-store';
 import type { RoutineStore, StoredRoutine } from '../routines/routine-store';
 import type { TokenStore, TokenPair } from '../auth/token-store';
+import type { CookieStore } from '../alexa-api/cookie-store';
+import type { AlexaCookieCredentials } from '../alexa-api/alexa-api-types';
 
 export class SqliteStorage {
   private db: Database.Database;
@@ -54,6 +56,14 @@ export class SqliteStorage {
         refresh_token TEXT NOT NULL,
         expires_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS cookies (
+        user_id TEXT PRIMARY KEY,
+        cookie TEXT NOT NULL,
+        csrf TEXT,
+        stored_at TEXT NOT NULL,
+        expires_at TEXT
+      );
     `);
   }
 
@@ -67,6 +77,10 @@ export class SqliteStorage {
 
   tokens(): SqliteTokenStore {
     return new SqliteTokenStore(this.db);
+  }
+
+  cookies(): SqliteCookieStore {
+    return new SqliteCookieStore(this.db);
   }
 
   close(): void {
@@ -258,6 +272,43 @@ function rowToRoutine(row: any): StoredRoutine {
     lastTriggered: row.last_triggered ?? undefined,
     createdAt: row.created_at,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Token store
+// ---------------------------------------------------------------------------
+
+export class SqliteCookieStore implements CookieStore {
+  constructor(private db: Database.Database) {}
+
+  async get(userId: string): Promise<AlexaCookieCredentials | null> {
+    const row = this.db.prepare(
+      'SELECT * FROM cookies WHERE user_id = ?'
+    ).get(userId) as any;
+    if (!row) return null;
+    return {
+      cookie: row.cookie,
+      csrf: row.csrf ?? undefined,
+      storedAt: row.stored_at,
+      expiresAt: row.expires_at ?? undefined,
+    };
+  }
+
+  async set(userId: string, creds: AlexaCookieCredentials): Promise<void> {
+    this.db.prepare(`
+      INSERT INTO cookies (user_id, cookie, csrf, stored_at, expires_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        cookie=excluded.cookie,
+        csrf=excluded.csrf,
+        stored_at=excluded.stored_at,
+        expires_at=excluded.expires_at
+    `).run(userId, creds.cookie, creds.csrf ?? null, creds.storedAt, creds.expiresAt ?? null);
+  }
+
+  async delete(userId: string): Promise<void> {
+    this.db.prepare('DELETE FROM cookies WHERE user_id = ?').run(userId);
+  }
 }
 
 // ---------------------------------------------------------------------------
