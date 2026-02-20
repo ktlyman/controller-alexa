@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+lambda.zip
+*.js.map
+.env
+.env.local
+*.db
+*.sqlite
+tests/test-storage.db

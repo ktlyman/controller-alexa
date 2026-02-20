@@ -1,0 +1,39 @@
+{
+  "name": "alexa-agent-tool",
+  "version": "0.1.0",
+  "description": "Agent tool for interacting with the Alexa ecosystem: device control, routine management, and real-time/historic event logging",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest --coverage",
+    "test:watch": "jest --watch",
+    "lint": "eslint 'src/**/*.ts' 'tests/**/*.ts'",
+    "clean": "rm -rf dist",
+    "start": "./scripts/start.sh",
+    "start:server": "node dist/server.js",
+    "dev": "ts-node src/server.ts",
+    "deploy": "./scripts/setup-lambda.sh"
+  },
+  "keywords": [
+    "alexa",
+    "smart-home",
+    "agent",
+    "iot",
+    "voice-assistant"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^12.6.2",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.0",
+    "@types/uuid": "^9.0.7",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.1",
+    "typescript": "^5.3.3"
+  }
+}
