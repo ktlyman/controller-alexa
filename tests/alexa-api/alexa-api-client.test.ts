@@ -2,6 +2,7 @@ import { AlexaApiClient } from '../../src/alexa-api/alexa-api-client';
 import type {
   RawSmartHomeEntity,
   RawEchoDevice,
+  GraphQLEndpointItem,
   AccountDevice,
 } from '../../src/alexa-api/alexa-api-types';
 
@@ -182,25 +183,86 @@ describe('AlexaApiClient', () => {
     });
   });
 
-  describe('getAllDevices', () => {
-    it('should normalize and merge devices from all sources', async () => {
+  describe('getSmartHomeEndpoints', () => {
+    it('should parse GraphQL endpoint response', async () => {
       client.setCredentials({
         cookie: 'session=abc',
         csrf: 'tok',
         storedAt: new Date().toISOString(),
       });
 
-      // Smart home response
-      mockResponse(200, JSON.stringify([
-        {
-          entityId: 'sh-1',
-          entityType: 'APPLIANCE',
-          friendlyName: 'Kitchen Light',
-          providerData: { categoryType: 'LIGHT', manufacturerName: 'LIFX' },
-          capabilities: [{ capabilityType: 'AlexaInterface', interfaceName: 'Alexa.PowerController' }],
-          reachable: true,
+      const graphqlResponse = {
+        data: {
+          endpoints: {
+            items: [
+              {
+                endpointId: 'amzn1.alexa.endpoint.abc',
+                id: 'amzn1.alexa.endpoint.abc',
+                friendlyName: 'Kitchen Light',
+                displayCategories: { primary: { value: 'LIGHT' } },
+                legacyAppliance: {
+                  applianceId: 'app-1',
+                  applianceTypes: ['LIGHT'],
+                  manufacturerName: 'LIFX',
+                  modelName: 'A19',
+                  actions: ['turnOn', 'turnOff', 'setBrightness'],
+                  isEnabled: true,
+                },
+                enablement: 'ENABLED',
+                manufacturer: { value: { text: 'LIFX' } },
+                model: { value: { text: 'A19' } },
+                features: [
+                  { name: 'power', operations: [{ name: 'turnOn' }, { name: 'turnOff' }] },
+                  { name: 'brightness', operations: [{ name: 'setBrightness' }] },
+                ],
+              },
+            ],
+          },
         },
-      ]));
+      };
+
+      mockResponse(200, JSON.stringify(graphqlResponse));
+
+      const result = await client.getSmartHomeEndpoints();
+      expect(result).toHaveLength(1);
+      expect(result[0].friendlyName).toBe('Kitchen Light');
+      expect(result[0].displayCategories?.primary?.value).toBe('LIGHT');
+    });
+  });
+
+  describe('getAllDevices', () => {
+    it('should normalize and merge devices from GraphQL + Echo sources', async () => {
+      client.setCredentials({
+        cookie: 'session=abc',
+        csrf: 'tok',
+        storedAt: new Date().toISOString(),
+      });
+
+      // GraphQL smart home endpoints
+      mockResponse(200, JSON.stringify({
+        data: {
+          endpoints: {
+            items: [
+              {
+                endpointId: 'amzn1.alexa.endpoint.sh1',
+                id: 'amzn1.alexa.endpoint.sh1',
+                friendlyName: 'Kitchen Light',
+                displayCategories: { primary: { value: 'LIGHT' } },
+                legacyAppliance: {
+                  applianceId: 'app-sh1',
+                  manufacturerName: 'LIFX',
+                  applianceNetworkState: { reachability: 'REACHABLE' },
+                },
+                enablement: 'ENABLED',
+                manufacturer: { value: { text: 'LIFX' } },
+                features: [
+                  { name: 'power', operations: [{ name: 'turnOn' }, { name: 'turnOff' }] },
+                ],
+              },
+            ],
+          },
+        },
+      }));
 
       // Echo response
       mockResponse(200, JSON.stringify({
@@ -224,19 +286,20 @@ describe('AlexaApiClient', () => {
           groupId: 'g1',
           groupName: 'Kitchen',
           groupType: 'ROOM',
-          members: [{ id: 'sh-1', type: 'APPLIANCE' }],
+          members: [{ id: 'amzn1.alexa.endpoint.sh1', type: 'APPLIANCE' }],
         },
       ]));
 
       const devices = await client.getAllDevices();
       expect(devices).toHaveLength(2);
 
-      const light = devices.find((d) => d.id === 'sh-1')!;
+      const light = devices.find((d) => d.id === 'amzn1.alexa.endpoint.sh1')!;
       expect(light.name).toBe('Kitchen Light');
       expect(light.source).toBe('smart_home');
       expect(light.deviceType).toBe('LIGHT');
       expect(light.manufacturer).toBe('LIFX');
-      expect(light.capabilities).toContain('Alexa.PowerController');
+      expect(light.capabilities).toContain('turnOn');
+      expect(light.capabilities).toContain('turnOff');
       expect(light.groups).toContain('Kitchen');
 
       const echo = devices.find((d) => d.id === 'ECHO-1')!;
@@ -252,15 +315,23 @@ describe('AlexaApiClient', () => {
         storedAt: new Date().toISOString(),
       });
 
-      // Smart home succeeds
-      mockResponse(200, JSON.stringify([
-        {
-          entityId: 'sh-1',
-          entityType: 'APPLIANCE',
-          friendlyName: 'Light',
-          reachable: true,
+      // GraphQL endpoints succeed
+      mockResponse(200, JSON.stringify({
+        data: {
+          endpoints: {
+            items: [
+              {
+                id: 'ep-1',
+                endpointId: 'ep-1',
+                friendlyName: 'Light',
+                displayCategories: { primary: { value: 'LIGHT' } },
+                enablement: 'ENABLED',
+                features: [],
+              },
+            ],
+          },
         },
-      ]));
+      }));
 
       // Echo fails
       mockResponse(500, 'Internal Server Error');
@@ -270,7 +341,7 @@ describe('AlexaApiClient', () => {
 
       const devices = await client.getAllDevices();
       expect(devices).toHaveLength(1);
-      expect(devices[0].id).toBe('sh-1');
+      expect(devices[0].id).toBe('ep-1');
     });
   });
 
@@ -383,17 +454,36 @@ describe('AlexaApiClient', () => {
       expect(valid).toBe(true);
     });
 
-    it('should return false on 401 response', async () => {
+    it('should return false on 401 from both bootstrap and devices', async () => {
       client.setCredentials({
         cookie: 'expired=cookie',
         csrf: 'tok',
         storedAt: new Date().toISOString(),
       });
 
+      // Bootstrap returns 401
+      mockResponse(401, 'Unauthorized');
+      // Fallback devices endpoint also returns 401
       mockResponse(401, 'Unauthorized');
 
       const valid = await client.validateCookie();
       expect(valid).toBe(false);
+    });
+
+    it('should return true when bootstrap fails but devices succeeds', async () => {
+      client.setCredentials({
+        cookie: 'valid=cookie',
+        csrf: 'tok',
+        storedAt: new Date().toISOString(),
+      });
+
+      // Bootstrap returns redirect
+      mockResponse(302, 'Redirect');
+      // Fallback devices endpoint succeeds
+      mockResponse(200, '{"devices":[]}');
+
+      const valid = await client.validateCookie();
+      expect(valid).toBe(true);
     });
   });
 });

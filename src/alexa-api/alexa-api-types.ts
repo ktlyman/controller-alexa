@@ -93,6 +93,54 @@ export interface RawDeviceGroup {
 }
 
 // ---------------------------------------------------------------------------
+// GraphQL endpoint response (POST /nexus/v1/graphql)
+// ---------------------------------------------------------------------------
+
+/** A single endpoint item from the GraphQL `endpoints` query. */
+export interface GraphQLEndpointItem {
+  endpointId: string;
+  id: string;
+  friendlyName: string;
+  displayCategories?: {
+    primary?: { value: string };
+  };
+  legacyAppliance?: {
+    applianceId: string;
+    applianceTypes?: string[];
+    friendlyName?: string;
+    friendlyDescription?: string;
+    manufacturerName?: string;
+    modelName?: string;
+    entityId?: string;
+    actions?: string[];
+    capabilities?: unknown[];
+    isEnabled?: boolean;
+    connectedVia?: string;
+    applianceNetworkState?: {
+      reachability?: string;
+      [key: string]: unknown;
+    };
+    driverIdentity?: {
+      namespace?: string;
+      identifier?: string;
+    };
+    additionalApplianceDetails?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  serialNumber?: { value?: { text?: string } };
+  enablement?: string;
+  manufacturer?: { value?: { text?: string } };
+  model?: { value?: { text?: string } };
+  features?: Array<{
+    name: string;
+    operations?: Array<{ name: string }>;
+    properties?: unknown[];
+    [key: string]: unknown;
+  }>;
+  [key: string]: unknown;
+}
+
+// ---------------------------------------------------------------------------
 // Normalized account device
 // ---------------------------------------------------------------------------
 

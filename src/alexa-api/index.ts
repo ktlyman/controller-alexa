@@ -9,4 +9,5 @@ export type {
   RawSmartHomeEntity,
   RawEchoDevice,
   RawDeviceGroup,
+  GraphQLEndpointItem,
 } from './alexa-api-types';

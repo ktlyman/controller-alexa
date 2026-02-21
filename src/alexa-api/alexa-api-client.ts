@@ -13,10 +13,67 @@ import type {
   RawSmartHomeEntity,
   RawEchoDevice,
   RawDeviceGroup,
+  GraphQLEndpointItem,
   AccountDevice,
   AccountDeviceCommand,
 } from './alexa-api-types';
 import { ALEXA_API_BASE_URLS } from './alexa-api-types';
+
+// ---------------------------------------------------------------------------
+// GraphQL query for all smart home endpoints (the modern Alexa app approach)
+// ---------------------------------------------------------------------------
+const ENDPOINTS_GRAPHQL_QUERY = `query Endpoints {
+  endpoints {
+    items {
+      endpointId
+      id
+      friendlyName
+      displayCategories {
+        primary {
+          value
+        }
+      }
+      legacyAppliance {
+        applianceId
+        applianceTypes
+        endpointTypeId
+        friendlyName
+        friendlyDescription
+        manufacturerName
+        connectedVia
+        modelName
+        entityId
+        actions
+        capabilities
+        applianceNetworkState
+        isEnabled
+        additionalApplianceDetails
+      }
+      serialNumber {
+        value {
+          text
+        }
+      }
+      enablement
+      model {
+        value {
+          text
+        }
+      }
+      manufacturer {
+        value {
+          text
+        }
+      }
+      features {
+        name
+        operations {
+          name
+        }
+      }
+    }
+  }
+}`;
 
 interface HttpResponse {
   statusCode: number;
@@ -61,8 +118,27 @@ export class AlexaApiClient {
   // -----------------------------------------------------------------------
 
   /**
-   * Fetch all smart home entities (lights, plugs, thermostats, etc.).
+   * Fetch ALL smart home endpoints via the GraphQL API.
+   * POST /nexus/v1/graphql
+   *
+   * This is the modern endpoint used by the Alexa mobile app and returns
+   * every smart home device (lights, plugs, thermostats, sensors, locks, etc.)
+   * — not just the subset available in routines.
+   */
+  async getSmartHomeEndpoints(): Promise<GraphQLEndpointItem[]> {
+    this.requireCredentials();
+    const body = JSON.stringify({ query: ENDPOINTS_GRAPHQL_QUERY });
+    const response = await this.request('POST', '/nexus/v1/graphql', body);
+    const data = this.parseJsonResponse(response);
+    return data?.data?.endpoints?.items ?? [];
+  }
+
+  /**
+   * Fetch smart home entities from the behaviors/entities endpoint.
    * GET /api/behaviors/entities?skillId=amzn1.ask.1p.smarthome
+   *
+   * NOTE: This only returns devices configured as routine triggers — a small
+   * subset. Prefer getSmartHomeEndpoints() for the full list.
    */
   async getSmartHomeDevices(): Promise<RawSmartHomeEntity[]> {
     this.requireCredentials();
@@ -98,11 +174,14 @@ export class AlexaApiClient {
 
   /**
    * Get ALL devices on the account, normalized into a unified shape.
-   * Fetches smart home devices, Echo devices, and groups in parallel.
+   *
+   * Uses the GraphQL endpoint (primary) + Echo REST API + groups in parallel.
+   * The GraphQL endpoint returns every smart home device; the REST endpoint
+   * adds Echo/media devices that the GraphQL query doesn't include.
    */
   async getAllDevices(): Promise<AccountDevice[]> {
-    const [smartHome, echoDevices, groups] = await Promise.all([
-      this.getSmartHomeDevices().catch(() => [] as RawSmartHomeEntity[]),
+    const [endpoints, echoDevices, groups] = await Promise.all([
+      this.getSmartHomeEndpoints().catch(() => [] as GraphQLEndpointItem[]),
       this.getEchoDevices().catch(() => [] as RawEchoDevice[]),
       this.getDeviceGroups().catch(() => [] as RawDeviceGroup[]),
     ]);
@@ -119,25 +198,38 @@ export class AlexaApiClient {
 
     const devices = new Map<string, AccountDevice>();
 
-    // Normalize smart home entities
-    for (const entity of smartHome) {
-      const id = entity.entityId;
+    // Normalize GraphQL endpoints (smart home devices, including lights, plugs, etc.)
+    for (const ep of endpoints) {
+      const id = ep.id ?? ep.endpointId;
+      const category = ep.displayCategories?.primary?.value ?? 'UNKNOWN';
+      const legacy = ep.legacyAppliance;
+      const reachability = legacy?.applianceNetworkState?.reachability;
+
+      // Extract feature names for capabilities
+      const featureOps: string[] = [];
+      for (const f of ep.features ?? []) {
+        for (const op of f.operations ?? []) {
+          featureOps.push(op.name);
+        }
+      }
+
       devices.set(id, {
         id,
-        name: entity.friendlyName ?? id,
+        name: ep.friendlyName ?? legacy?.friendlyName ?? id,
         source: 'smart_home',
-        deviceType: entity.providerData?.categoryType ?? entity.entityType ?? 'UNKNOWN',
-        online: entity.reachable ?? true,
-        manufacturer: entity.providerData?.manufacturerName,
-        model: entity.providerData?.modelName,
-        skillId: entity.providerData?.skillId,
-        capabilities: (entity.capabilities ?? []).map((c) => c.interfaceName),
-        groups: groupMembership.get(id),
-        raw: entity as unknown as Record<string, unknown>,
+        deviceType: category,
+        online: reachability === 'REACHABLE' || (reachability == null && ep.enablement === 'ENABLED'),
+        manufacturer: ep.manufacturer?.value?.text ?? legacy?.manufacturerName,
+        model: ep.model?.value?.text ?? legacy?.modelName,
+        capabilities: featureOps.length > 0
+          ? featureOps
+          : (legacy?.actions ?? []),
+        groups: groupMembership.get(id) ?? groupMembership.get(legacy?.applianceId ?? ''),
+        raw: ep as unknown as Record<string, unknown>,
       });
     }
 
-    // Normalize Echo devices
+    // Normalize Echo devices (only add if not already present from GraphQL)
     for (const echo of echoDevices) {
       const id = echo.serialNumber;
       if (!devices.has(id)) {
@@ -403,9 +495,15 @@ export class AlexaApiClient {
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.baseUrl);
 
+      // The /nexus/v1/graphql endpoint requires a mobile-app User-Agent
+      const isGraphQL = path.startsWith('/nexus/');
+      const userAgent = isGraphQL
+        ? 'AmazonWebView/AmazonAlexa/2.2.663733.0/iOS/18.5/iPhone'
+        : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36';
+
       const headers: Record<string, string> = {
         Cookie: this.credentials!.cookie,
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'User-Agent': userAgent,
         Accept: 'application/json',
         'Accept-Language': 'en-US',
         Origin: this.baseUrl,
