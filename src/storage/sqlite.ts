@@ -13,6 +13,8 @@ import type { CookieStore } from '../alexa-api/cookie-store';
 import type { AlexaCookieCredentials, DeviceStateSnapshot, ActivityRecord } from '../alexa-api/alexa-api-types';
 import type { DeviceStateStore, DeviceStateQuery, DeviceStateQueryResult } from '../alexa-api/device-state-store';
 import type { ActivityStore, ActivityQuery, ActivityQueryResult } from '../alexa-api/activity-store';
+import type { PushEventStore, PushEventQuery, PushEventQueryResult } from '../alexa-api/push-event-store';
+import type { StoredPushEvent } from '../alexa-api/push-event-types';
 
 export class SqliteStorage {
   private db: Database.Database;
@@ -92,6 +94,22 @@ export class SqliteStorage {
       );
       CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_history(timestamp);
       CREATE INDEX IF NOT EXISTS idx_activity_device_serial ON activity_history(device_serial);
+
+      CREATE TABLE IF NOT EXISTS push_events (
+        id TEXT PRIMARY KEY,
+        timestamp TEXT NOT NULL,
+        command TEXT NOT NULL,
+        device_serial TEXT,
+        device_type TEXT,
+        device_name TEXT,
+        payload TEXT NOT NULL DEFAULT '{}',
+        processed INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_push_events_timestamp ON push_events(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_push_events_command ON push_events(command);
+      CREATE INDEX IF NOT EXISTS idx_push_events_device_serial ON push_events(device_serial);
+      CREATE INDEX IF NOT EXISTS idx_push_events_command_timestamp ON push_events(command, timestamp);
+      CREATE INDEX IF NOT EXISTS idx_push_events_processed ON push_events(processed);
     `);
   }
 
@@ -117,6 +135,10 @@ export class SqliteStorage {
 
   activities(): SqliteActivityStore {
     return new SqliteActivityStore(this.db);
+  }
+
+  pushEvents(): SqlitePushEventStore {
+    return new SqlitePushEventStore(this.db);
   }
 
   close(): void {
@@ -541,6 +563,106 @@ function rowToActivity(row: any): ActivityRecord {
     responseText: row.response_text ?? undefined,
     utteranceType: row.utterance_type ?? undefined,
     raw: row.raw ? JSON.parse(row.raw) : undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Push event store
+// ---------------------------------------------------------------------------
+
+export class SqlitePushEventStore implements PushEventStore {
+  constructor(private db: Database.Database) {}
+
+  async insert(event: StoredPushEvent): Promise<void> {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO push_events (id, timestamp, command, device_serial, device_type, device_name, payload, processed)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      event.id,
+      event.timestamp,
+      event.command,
+      event.deviceSerial ?? null,
+      event.deviceType ?? null,
+      event.deviceName ?? null,
+      JSON.stringify(event.payload),
+      event.processed ? 1 : 0,
+    );
+  }
+
+  async insertBatch(events: StoredPushEvent[]): Promise<void> {
+    const stmt = this.db.prepare(`
+      INSERT OR IGNORE INTO push_events (id, timestamp, command, device_serial, device_type, device_name, payload, processed)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const tx = this.db.transaction((items: StoredPushEvent[]) => {
+      for (const e of items) {
+        stmt.run(
+          e.id, e.timestamp, e.command,
+          e.deviceSerial ?? null, e.deviceType ?? null, e.deviceName ?? null,
+          JSON.stringify(e.payload),
+          e.processed ? 1 : 0,
+        );
+      }
+    });
+    tx(events);
+  }
+
+  async query(query: PushEventQuery): Promise<PushEventQueryResult> {
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    if (query.command) { conditions.push('command = ?'); params.push(query.command); }
+    if (query.deviceSerial) { conditions.push('device_serial = ?'); params.push(query.deviceSerial); }
+    if (query.startTime) { conditions.push('timestamp >= ?'); params.push(query.startTime); }
+    if (query.endTime) { conditions.push('timestamp <= ?'); params.push(query.endTime); }
+    if (query.processed !== undefined) { conditions.push('processed = ?'); params.push(query.processed ? 1 : 0); }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const countRow = this.db.prepare(
+      `SELECT COUNT(*) as cnt FROM push_events ${where}`
+    ).get(...params) as { cnt: number };
+
+    const limit = query.limit ?? 100;
+    const offset = query.offset ?? 0;
+
+    const rows = this.db.prepare(
+      `SELECT * FROM push_events ${where} ORDER BY timestamp DESC LIMIT ? OFFSET ?`
+    ).all(...params, limit, offset) as any[];
+
+    return {
+      events: rows.map(rowToPushEvent),
+      totalCount: countRow.cnt,
+    };
+  }
+
+  async getById(id: string): Promise<StoredPushEvent | null> {
+    const row = this.db.prepare(
+      'SELECT * FROM push_events WHERE id = ?'
+    ).get(id) as any;
+    return row ? rowToPushEvent(row) : null;
+  }
+
+  async markProcessed(id: string): Promise<void> {
+    this.db.prepare('UPDATE push_events SET processed = 1 WHERE id = ?').run(id);
+  }
+
+  async prune(olderThan: string): Promise<number> {
+    const result = this.db.prepare('DELETE FROM push_events WHERE timestamp < ?').run(olderThan);
+    return result.changes;
+  }
+}
+
+function rowToPushEvent(row: any): StoredPushEvent {
+  return {
+    id: row.id,
+    timestamp: row.timestamp,
+    command: row.command,
+    deviceSerial: row.device_serial ?? undefined,
+    deviceType: row.device_type ?? undefined,
+    deviceName: row.device_name ?? undefined,
+    payload: JSON.parse(row.payload),
+    processed: row.processed === 1,
   };
 }
 

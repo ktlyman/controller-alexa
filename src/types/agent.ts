@@ -16,6 +16,7 @@ import type {
 } from './alexa';
 import type { AccountDevice, AccountDeviceCommand, DeviceStateSnapshot, ActivityRecord } from '../alexa-api/alexa-api-types';
 import type { StoredEvent, EventQuery } from '../events/event-store';
+import type { StoredPushEvent } from '../alexa-api/push-event-types';
 
 // ---------------------------------------------------------------------------
 // Tool action discriminated union
@@ -37,7 +38,10 @@ export type AgentAction =
   | PollDeviceStateAction
   | PollAllStatesAction
   | GetActivityHistoryAction
-  | QueryStateHistoryAction;
+  | QueryStateHistoryAction
+  | StartPushListenerAction
+  | StopPushListenerAction
+  | QueryPushEventsAction;
 
 // -- Device actions ---------------------------------------------------------
 
@@ -184,6 +188,34 @@ export interface QueryStateHistoryAction {
   offset?: number;
 }
 
+// -- Push listener actions ---------------------------------------------------
+
+export interface StartPushListenerAction {
+  type: 'start_push_listener';
+}
+
+export interface StopPushListenerAction {
+  type: 'stop_push_listener';
+}
+
+export interface QueryPushEventsAction {
+  type: 'query_push_events';
+  /** Filter by push event command (e.g., 'PUSH_ACTIVITY') */
+  command?: string;
+  /** Filter by device serial number */
+  deviceSerial?: string;
+  /** ISO-8601 start time */
+  startTime?: string;
+  /** ISO-8601 end time */
+  endTime?: string;
+  /** Filter by processed flag */
+  processed?: boolean;
+  /** Max results (default 100) */
+  limit?: number;
+  /** Pagination offset (default 0) */
+  offset?: number;
+}
+
 // -- Event actions ----------------------------------------------------------
 
 export interface QueryEventsAction {
@@ -229,6 +261,9 @@ export type PollDeviceStateResult = { state: DeviceStateSnapshot };
 export type PollAllStatesResult = { states: DeviceStateSnapshot[]; polledCount: number; errorCount: number };
 export type GetActivityHistoryResult = { records: ActivityRecord[]; recordCount: number; nextToken?: string };
 export type QueryStateHistoryResult = { snapshots: DeviceStateSnapshot[]; totalCount: number };
+export type StartPushListenerResult = { status: 'connected' | 'already_connected'; connectionId: string };
+export type StopPushListenerResult = { status: 'disconnected' | 'already_disconnected' };
+export type QueryPushEventsResult = { events: StoredPushEvent[]; totalCount: number };
 
 export interface RoutineSummary {
   id: string;

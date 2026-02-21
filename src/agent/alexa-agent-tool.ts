@@ -31,6 +31,10 @@ import { InMemoryDeviceStateStore } from '../alexa-api/device-state-store';
 import type { DeviceStateStore } from '../alexa-api/device-state-store';
 import { InMemoryActivityStore } from '../alexa-api/activity-store';
 import type { ActivityStore } from '../alexa-api/activity-store';
+import { InMemoryPushEventStore } from '../alexa-api/push-event-store';
+import type { PushEventStore } from '../alexa-api/push-event-store';
+import { AlexaPushClient } from '../alexa-api/push-client';
+import type { PushEvent, StoredPushEvent } from '../alexa-api/push-event-types';
 import type {
   AgentAction,
   AgentToolResult,
@@ -50,6 +54,9 @@ import type {
   PollAllStatesResult,
   GetActivityHistoryResult,
   QueryStateHistoryResult,
+  StartPushListenerResult,
+  StopPushListenerResult,
+  QueryPushEventsResult,
 } from '../types/agent';
 
 export class AlexaAgentTool {
@@ -64,6 +71,8 @@ export class AlexaAgentTool {
   private cookieStore: CookieStore;
   private deviceStateStore: DeviceStateStore;
   private activityStore: ActivityStore;
+  private pushEventStore: PushEventStore;
+  private pushClient: AlexaPushClient | null = null;
   private cleanup?: () => void;
 
   /** The user ID for the current session. */
@@ -82,6 +91,7 @@ export class AlexaAgentTool {
     cookieStore?: CookieStore;
     deviceStateStore?: DeviceStateStore;
     activityStore?: ActivityStore;
+    pushEventStore?: PushEventStore;
   }) {
     this.config = loadConfig(opts?.config);
     this.userId = opts?.userId ?? 'default-user';
@@ -92,6 +102,7 @@ export class AlexaAgentTool {
     let cookieStore = opts?.cookieStore;
     let deviceStateStore = opts?.deviceStateStore;
     let activityStore = opts?.activityStore;
+    let pushEventStore = opts?.pushEventStore;
 
     // Auto-create SQLite stores when configured and no override provided
     if (this.config.storageBackend === 'sqlite' && (!eventStore || !routineStore || !tokenStore || !cookieStore)) {
@@ -105,6 +116,7 @@ export class AlexaAgentTool {
       cookieStore = cookieStore ?? storage.cookies();
       deviceStateStore = deviceStateStore ?? storage.deviceStates();
       activityStore = activityStore ?? storage.activities();
+      pushEventStore = pushEventStore ?? storage.pushEvents();
       this.cleanup = () => storage.close();
     }
 
@@ -117,6 +129,7 @@ export class AlexaAgentTool {
     this.cookieStore = cookieStore ?? new InMemoryCookieStore();
     this.deviceStateStore = deviceStateStore ?? new InMemoryDeviceStateStore();
     this.activityStore = activityStore ?? new InMemoryActivityStore();
+    this.pushEventStore = pushEventStore ?? new InMemoryPushEventStore();
     this.alexaApi = new AlexaApiClient(this.config.region as AlexaApiRegion);
   }
 
@@ -125,6 +138,10 @@ export class AlexaAgentTool {
    * Call this when you're done using the tool.
    */
   close(): void {
+    if (this.pushClient) {
+      this.pushClient.disconnect();
+      this.pushClient = null;
+    }
     this.cleanup?.();
   }
 
@@ -139,6 +156,7 @@ export class AlexaAgentTool {
   getEventLogger(): EventLogger { return this.eventLogger; }
   getEventGateway(): EventGatewayClient { return this.eventGateway; }
   getAlexaApiClient(): AlexaApiClient { return this.alexaApi; }
+  getPushClient(): AlexaPushClient | null { return this.pushClient; }
 
   // -----------------------------------------------------------------------
   // Main dispatch
@@ -204,6 +222,15 @@ export class AlexaAgentTool {
           break;
         case 'query_state_history':
           data = await this.queryStateHistory(action.deviceId, action.startTime, action.endTime, action.limit, action.offset);
+          break;
+        case 'start_push_listener':
+          data = await this.startPushListener();
+          break;
+        case 'stop_push_listener':
+          data = await this.stopPushListener();
+          break;
+        case 'query_push_events':
+          data = await this.queryPushEvents(action);
           break;
         default: {
           const _exhaustive: never = action;
@@ -675,6 +702,141 @@ export class AlexaAgentTool {
     });
 
     return { snapshots: result.snapshots, totalCount: result.totalCount };
+  }
+
+  // -----------------------------------------------------------------------
+  // Push listener actions
+  // -----------------------------------------------------------------------
+
+  private async startPushListener(): Promise<StartPushListenerResult> {
+    if (this.pushClient?.isConnected()) {
+      return {
+        status: 'already_connected',
+        connectionId: this.pushClient.getConnectionId() ?? 'unknown',
+      };
+    }
+
+    await this.ensureCookieLoaded();
+    const creds = this.alexaApi.getCredentials();
+    if (!creds) {
+      throw new Error(
+        'No Alexa cookie configured. Use the set_alexa_cookie action first.',
+      );
+    }
+
+    // Disconnect any existing client before creating new one
+    if (this.pushClient) {
+      this.pushClient.disconnect();
+    }
+
+    const region = (this.config.region as import('../alexa-api/alexa-api-types').AlexaApiRegion) ?? 'NA';
+
+    this.pushClient = new AlexaPushClient({
+      cookie: creds.cookie,
+      region,
+      onEvent: (event) => this.handlePushEvent(event),
+      onStateChange: (state) => {
+        this.eventLogger.logCustomEvent({
+          eventType: 'PushListenerStateChange',
+          namespace: 'AlexaPushClient',
+          userId: this.userId,
+          payload: { state },
+          tags: ['push_listener', 'connection'],
+        }).catch(() => {});
+      },
+      onError: (error) => {
+        this.eventLogger.logCustomEvent({
+          eventType: 'PushListenerError',
+          namespace: 'AlexaPushClient',
+          userId: this.userId,
+          payload: { error: error.message },
+          tags: ['push_listener', 'error'],
+        }).catch(() => {});
+      },
+    });
+
+    await this.pushClient.connect();
+
+    const connectionId = this.pushClient.getConnectionId() ?? 'unknown';
+
+    await this.eventLogger.logCustomEvent({
+      eventType: 'AgentStartPushListener',
+      namespace: 'AlexaAgentTool',
+      userId: this.userId,
+      payload: { connectionId },
+      tags: ['agent_action', 'push_listener'],
+    });
+
+    return { status: 'connected', connectionId };
+  }
+
+  private async stopPushListener(): Promise<StopPushListenerResult> {
+    if (!this.pushClient || !this.pushClient.isConnected()) {
+      return { status: 'already_disconnected' };
+    }
+
+    this.pushClient.disconnect();
+    this.pushClient = null;
+
+    await this.eventLogger.logCustomEvent({
+      eventType: 'AgentStopPushListener',
+      namespace: 'AlexaAgentTool',
+      userId: this.userId,
+      payload: {},
+      tags: ['agent_action', 'push_listener'],
+    });
+
+    return { status: 'disconnected' };
+  }
+
+  private async queryPushEvents(
+    action: import('../types/agent').QueryPushEventsAction,
+  ): Promise<QueryPushEventsResult> {
+    const result = await this.pushEventStore.query({
+      command: action.command,
+      deviceSerial: action.deviceSerial,
+      startTime: action.startTime,
+      endTime: action.endTime,
+      processed: action.processed,
+      limit: action.limit,
+      offset: action.offset,
+    });
+
+    return { events: result.events, totalCount: result.totalCount };
+  }
+
+  /**
+   * Handle an incoming push event from the WebSocket client.
+   * Normalizes and stores the event, logs it, and (for PUSH_ACTIVITY)
+   * triggers an activity history fetch.
+   */
+  private async handlePushEvent(event: PushEvent): Promise<void> {
+    const id = `pe-${event.command}-${event.timestamp}-${event.deviceSerial ?? 'unknown'}`;
+
+    const stored: StoredPushEvent = {
+      id,
+      timestamp: new Date(event.timestamp).toISOString(),
+      command: event.command,
+      deviceSerial: event.deviceSerial,
+      deviceType: event.deviceType,
+      payload: event.payload,
+      processed: false,
+    };
+
+    try {
+      await this.pushEventStore.insert(stored);
+    } catch {}
+
+    try {
+      await this.eventLogger.logCustomEvent({
+        eventType: 'PushEventReceived',
+        namespace: 'AlexaPushClient',
+        endpointId: event.deviceSerial,
+        userId: this.userId,
+        payload: { command: event.command, deviceType: event.deviceType },
+        tags: ['push_event', event.command],
+      });
+    } catch {}
   }
 
   /**

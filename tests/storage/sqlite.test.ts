@@ -1,10 +1,11 @@
 import path from 'path';
 import fs from 'fs';
-import { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore, SqliteCookieStore, SqliteDeviceStateStore, SqliteActivityStore } from '../../src/storage/sqlite';
+import { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore, SqliteCookieStore, SqliteDeviceStateStore, SqliteActivityStore, SqlitePushEventStore } from '../../src/storage/sqlite';
 import type { StoredEvent } from '../../src/events/event-store';
 import type { StoredRoutine } from '../../src/routines/routine-store';
 import type { TokenPair } from '../../src/auth/token-store';
 import type { AlexaCookieCredentials, DeviceStateSnapshot, ActivityRecord } from '../../src/alexa-api/alexa-api-types';
+import type { StoredPushEvent } from '../../src/alexa-api/push-event-types';
 
 const TEST_DB = path.join(__dirname, '..', 'test-storage.db');
 
@@ -47,6 +48,7 @@ describe('SqliteStorage', () => {
     expect(storage.cookies()).toBeInstanceOf(SqliteCookieStore);
     expect(storage.deviceStates()).toBeInstanceOf(SqliteDeviceStateStore);
     expect(storage.activities()).toBeInstanceOf(SqliteActivityStore);
+    expect(storage.pushEvents()).toBeInstanceOf(SqlitePushEventStore);
   });
 });
 
@@ -664,6 +666,176 @@ describe('SqliteActivityStore', () => {
     const result = await store2.getById('rec-1');
     expect(result).not.toBeNull();
     expect(result!.utteranceText).toBe('turn on the lights');
+    storage2.close();
+  });
+});
+
+describe('SqlitePushEventStore', () => {
+  let storage: SqliteStorage;
+  let store: SqlitePushEventStore;
+
+  beforeEach(() => {
+    try { fs.unlinkSync(TEST_DB); } catch {}
+    storage = new SqliteStorage(TEST_DB);
+    store = storage.pushEvents();
+  });
+
+  afterEach(() => {
+    storage.close();
+    try { fs.unlinkSync(TEST_DB); } catch {}
+  });
+
+  function makeEvent(overrides: Partial<StoredPushEvent> = {}): StoredPushEvent {
+    return {
+      id: `pe-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: new Date().toISOString(),
+      command: 'PUSH_ACTIVITY',
+      payload: {},
+      processed: false,
+      ...overrides,
+    };
+  }
+
+  it('should insert and query an event', async () => {
+    await store.insert(makeEvent({ id: 'pe-1', command: 'PUSH_ACTIVITY' }));
+    const result = await store.query({});
+    expect(result.events).toHaveLength(1);
+    expect(result.totalCount).toBe(1);
+    expect(result.events[0].id).toBe('pe-1');
+    expect(result.events[0].command).toBe('PUSH_ACTIVITY');
+  });
+
+  it('should deduplicate by id (INSERT OR IGNORE)', async () => {
+    await store.insert(makeEvent({ id: 'dup-1', command: 'PUSH_ACTIVITY' }));
+    await store.insert(makeEvent({ id: 'dup-1', command: 'PUSH_VOLUME_CHANGE' }));
+
+    const result = await store.query({});
+    expect(result.totalCount).toBe(1);
+    expect(result.events[0].command).toBe('PUSH_ACTIVITY');
+  });
+
+  it('should insert batch with dedup', async () => {
+    await store.insertBatch([
+      makeEvent({ id: 'b1' }),
+      makeEvent({ id: 'b2' }),
+      makeEvent({ id: 'b1' }), // duplicate
+    ]);
+
+    const result = await store.query({});
+    expect(result.totalCount).toBe(2);
+  });
+
+  it('should filter by command', async () => {
+    await store.insert(makeEvent({ id: 'c1', command: 'PUSH_ACTIVITY' }));
+    await store.insert(makeEvent({ id: 'c2', command: 'PUSH_VOLUME_CHANGE' }));
+    await store.insert(makeEvent({ id: 'c3', command: 'PUSH_ACTIVITY' }));
+
+    const result = await store.query({ command: 'PUSH_ACTIVITY' });
+    expect(result.totalCount).toBe(2);
+  });
+
+  it('should filter by deviceSerial', async () => {
+    await store.insert(makeEvent({ id: 'd1', deviceSerial: 'ECHO-1' }));
+    await store.insert(makeEvent({ id: 'd2', deviceSerial: 'ECHO-2' }));
+    await store.insert(makeEvent({ id: 'd3', deviceSerial: 'ECHO-1' }));
+
+    const result = await store.query({ deviceSerial: 'ECHO-1' });
+    expect(result.totalCount).toBe(2);
+  });
+
+  it('should filter by time range', async () => {
+    await store.insert(makeEvent({ id: 't1', timestamp: '2024-01-01T00:00:00Z' }));
+    await store.insert(makeEvent({ id: 't2', timestamp: '2024-06-15T00:00:00Z' }));
+    await store.insert(makeEvent({ id: 't3', timestamp: '2024-12-01T00:00:00Z' }));
+
+    const result = await store.query({
+      startTime: '2024-03-01T00:00:00Z',
+      endTime: '2024-09-01T00:00:00Z',
+    });
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0].id).toBe('t2');
+  });
+
+  it('should filter by processed flag', async () => {
+    await store.insert(makeEvent({ id: 'p1', processed: false }));
+    await store.insert(makeEvent({ id: 'p2', processed: true }));
+    await store.insert(makeEvent({ id: 'p3', processed: false }));
+
+    const unprocessed = await store.query({ processed: false });
+    expect(unprocessed.totalCount).toBe(2);
+
+    const processed = await store.query({ processed: true });
+    expect(processed.totalCount).toBe(1);
+  });
+
+  it('should paginate with limit and offset', async () => {
+    for (let i = 0; i < 10; i++) {
+      await store.insert(makeEvent({
+        id: `pg-${i}`,
+        timestamp: `2024-01-${String(i + 1).padStart(2, '0')}T00:00:00Z`,
+      }));
+    }
+
+    const page = await store.query({ limit: 3, offset: 0 });
+    expect(page.events).toHaveLength(3);
+    expect(page.totalCount).toBe(10);
+  });
+
+  it('should get by id', async () => {
+    await store.insert(makeEvent({ id: 'find-me', command: 'PUSH_VOLUME_CHANGE' }));
+    const found = await store.getById('find-me');
+    expect(found).not.toBeNull();
+    expect(found!.command).toBe('PUSH_VOLUME_CHANGE');
+
+    expect(await store.getById('nonexistent')).toBeNull();
+  });
+
+  it('should mark as processed', async () => {
+    await store.insert(makeEvent({ id: 'mark-me', processed: false }));
+    await store.markProcessed('mark-me');
+
+    const found = await store.getById('mark-me');
+    expect(found!.processed).toBe(true);
+  });
+
+  it('should prune old events', async () => {
+    await store.insert(makeEvent({ id: 'pr1', timestamp: '2024-01-01T00:00:00Z' }));
+    await store.insert(makeEvent({ id: 'pr2', timestamp: '2024-06-01T00:00:00Z' }));
+    await store.insert(makeEvent({ id: 'pr3', timestamp: '2024-12-01T00:00:00Z' }));
+
+    const pruned = await store.prune('2024-05-01T00:00:00Z');
+    expect(pruned).toBe(1);
+    expect((await store.query({})).totalCount).toBe(2);
+  });
+
+  it('should store optional fields', async () => {
+    await store.insert(makeEvent({
+      id: 'full-1',
+      deviceSerial: 'G0911234',
+      deviceType: 'A3S5BH2HU6VAYF',
+      deviceName: 'Kitchen Echo',
+      payload: { dopplerId: { deviceSerialNumber: 'G0911234', deviceType: 'A3S5BH2HU6VAYF' } },
+    }));
+
+    const found = await store.getById('full-1');
+    expect(found!.deviceSerial).toBe('G0911234');
+    expect(found!.deviceType).toBe('A3S5BH2HU6VAYF');
+    expect(found!.deviceName).toBe('Kitchen Echo');
+    expect(found!.payload).toEqual({
+      dopplerId: { deviceSerialNumber: 'G0911234', deviceType: 'A3S5BH2HU6VAYF' },
+    });
+  });
+
+  it('should persist across reopen', async () => {
+    await store.insert(makeEvent({ id: 'persist-pe', command: 'PUSH_ACTIVITY', processed: false }));
+    storage.close();
+
+    const storage2 = new SqliteStorage(TEST_DB);
+    const store2 = storage2.pushEvents();
+    const found = await store2.getById('persist-pe');
+    expect(found).not.toBeNull();
+    expect(found!.command).toBe('PUSH_ACTIVITY');
+    expect(found!.processed).toBe(false);
     storage2.close();
   });
 });

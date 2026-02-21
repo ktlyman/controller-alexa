@@ -25,14 +25,19 @@ export type { EventStore, StoredEvent, EventQuery, EventQueryResult, EventListen
 export { createHandler } from './lambda';
 export type { LambdaContext } from './lambda';
 
-export { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore, SqliteCookieStore, SqliteDeviceStateStore, SqliteActivityStore } from './storage';
+export { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore, SqliteCookieStore, SqliteDeviceStateStore, SqliteActivityStore, SqlitePushEventStore } from './storage';
 
 // Unofficial Alexa API
-export { AlexaApiClient, InMemoryCookieStore, InMemoryDeviceStateStore, InMemoryActivityStore } from './alexa-api';
+export { AlexaApiClient, InMemoryCookieStore, InMemoryDeviceStateStore, InMemoryActivityStore, InMemoryPushEventStore } from './alexa-api';
+export { AlexaPushClient } from './alexa-api/push-client';
+export type { PushClientOptions, PushClientState } from './alexa-api/push-client';
+export { ALEXA_PUSH_WS_HOSTS, FABE } from './alexa-api/push-event-types';
 export type {
   CookieStore, AlexaCookieCredentials, AccountDevice, AccountDeviceCommand, AlexaApiRegion,
   DeviceStateStore, DeviceStateQuery, DeviceStateQueryResult,
   ActivityStore, ActivityQuery, ActivityQueryResult,
+  PushEventStore, PushEventQuery, PushEventQueryResult,
+  PushEventCommand, PushEvent, StoredPushEvent,
   ParsedCapabilityState, DeviceStateSnapshot, ActivityRecord,
 } from './alexa-api';
 
@@ -86,4 +91,10 @@ export type {
   PollAllStatesResult,
   GetActivityHistoryResult,
   QueryStateHistoryResult,
+  StartPushListenerAction,
+  StopPushListenerAction,
+  QueryPushEventsAction,
+  StartPushListenerResult,
+  StopPushListenerResult,
+  QueryPushEventsResult,
 } from './types/agent';

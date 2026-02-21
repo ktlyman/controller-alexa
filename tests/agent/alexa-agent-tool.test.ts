@@ -269,6 +269,10 @@ describe('AlexaAgentTool', () => {
     it('should expose alexa API client', () => {
       expect(tool.getAlexaApiClient()).toBeDefined();
     });
+
+    it('should expose push client (null when not started)', () => {
+      expect(tool.getPushClient()).toBeNull();
+    });
   });
 
   describe('set_alexa_cookie', () => {
@@ -365,6 +369,52 @@ describe('AlexaAgentTool', () => {
         deviceId: 'entity-1',
         startTime: '2024-01-01T00:00:00Z',
         endTime: '2024-12-31T23:59:59Z',
+        limit: 10,
+        offset: 0,
+      });
+      expect(result.success).toBe(true);
+      expect((result.data as any).totalCount).toBe(0);
+    });
+  });
+
+  describe('start_push_listener', () => {
+    it('should fail without cookie configured', async () => {
+      const result = await tool.execute({
+        type: 'start_push_listener',
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('No Alexa cookie configured');
+    });
+  });
+
+  describe('stop_push_listener', () => {
+    it('should return already_disconnected when not connected', async () => {
+      const result = await tool.execute({
+        type: 'stop_push_listener',
+      });
+      expect(result.success).toBe(true);
+      expect((result.data as any).status).toBe('already_disconnected');
+    });
+  });
+
+  describe('query_push_events', () => {
+    it('should return empty results from fresh store', async () => {
+      const result = await tool.execute({
+        type: 'query_push_events',
+      });
+      expect(result.success).toBe(true);
+      expect((result.data as any).events).toEqual([]);
+      expect((result.data as any).totalCount).toBe(0);
+    });
+
+    it('should accept filter parameters', async () => {
+      const result = await tool.execute({
+        type: 'query_push_events',
+        command: 'PUSH_ACTIVITY',
+        deviceSerial: 'G091234',
+        startTime: '2024-01-01T00:00:00Z',
+        endTime: '2024-12-31T23:59:59Z',
+        processed: false,
         limit: 10,
         offset: 0,
       });

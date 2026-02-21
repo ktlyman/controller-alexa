@@ -45,6 +45,25 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Push listener status
+  if (req.method === 'GET' && req.url === '/push-status') {
+    const pushClient = tool.getPushClient();
+    const status = pushClient
+      ? {
+          connected: pushClient.isConnected(),
+          state: pushClient.getState(),
+          connectionId: pushClient.getConnectionId(),
+          lastEventTime: pushClient.getLastEventTime()
+            ? new Date(pushClient.getLastEventTime()!).toISOString()
+            : null,
+          eventCount: pushClient.getEventCount(),
+        }
+      : { connected: false, state: 'disconnected', connectionId: null, lastEventTime: null, eventCount: 0 };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(status));
+    return;
+  }
+
   // Browser-based cookie extraction page
   if (req.method === 'GET' && req.url === '/extract-cookie') {
     res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -223,8 +242,9 @@ server.listen(port, () => {
   console.log(`    POST /directive  — receives forwarded Alexa directives`);
   console.log(`    POST /action     — receives agent tool actions`);
   console.log(`    GET  /health     — health check`);
-  console.log(`    GET  /cookie-status — unofficial API cookie status
-    GET  /extract-cookie — browser-based cookie extraction page`);
+  console.log(`    GET  /cookie-status — unofficial API cookie status`);
+  console.log(`    GET  /push-status   — push listener connection status`);
+  console.log(`    GET  /extract-cookie — browser-based cookie extraction page`);
 });
 
 // Graceful shutdown
