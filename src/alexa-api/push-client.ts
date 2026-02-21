@@ -73,13 +73,21 @@ function generateUUID(): string {
   return chars.join('');
 }
 
-function toUint32(value: number): number {
+/**
+ * Convert a potentially negative JS number to unsigned 32-bit.
+ * For positive values > 2^32, preserves the full value (needed for carry extraction).
+ */
+function toUnsigned(value: number): number {
   if (value < 0) return 0xFFFFFFFF + value + 1;
-  return value >>> 0;
+  return value;
 }
 
-function rightShift(value: number, bits: number): number {
-  let v = toUint32(value);
+/**
+ * Unsigned right-shift via repeated division (avoids JS `>>>` 32-bit truncation).
+ * Preserves values > 2^32 so carry bits are not lost.
+ */
+function shiftRight(value: number, bits: number): number {
+  let v = toUnsigned(value);
   while (bits > 0 && v !== 0) {
     v = Math.floor(v / 2);
     bits--;
@@ -87,6 +95,15 @@ function rightShift(value: number, bits: number): number {
   return v;
 }
 
+/**
+ * Compute the FABE protocol checksum.
+ *
+ * Accumulates bytes in big-endian 32-bit words with carry folding.
+ * The exclusion window [excludeStart, excludeEnd) is skipped — this
+ * is used to zero-out the checksum placeholder field while hashing.
+ *
+ * Port of alexa-remote2's `computeChecksum()`.
+ */
 function computeChecksum(buffer: Buffer, excludeStart: number, excludeEnd: number): number {
   const bytes = new Uint8Array(buffer);
   let sum = 0;
@@ -99,18 +116,18 @@ function computeChecksum(buffer: Buffer, excludeStart: number, excludeEnd: numbe
     }
 
     const shiftAmount = ((i & 3) ^ 3) << 3;
-    sum += toUint32(bytes[i] << shiftAmount);
-    carry += rightShift(sum, 32);
-    sum = toUint32(sum & 0xFFFFFFFF);
+    sum += toUnsigned(bytes[i] << shiftAmount);
+    carry += shiftRight(sum, 32);
+    sum = toUnsigned(sum & 0xFFFFFFFF);
   }
 
   while (carry) {
     sum += carry;
-    carry = rightShift(sum, 32);
+    carry = shiftRight(sum, 32);
     sum &= 0xFFFFFFFF;
   }
 
-  return toUint32(sum);
+  return toUnsigned(sum);
 }
 
 function readHex(data: Buffer, index: number, length: number): number {
@@ -658,7 +675,7 @@ export class AlexaPushClient {
           ? 'https://alexa.amazon.co.uk'
           : 'https://alexa.amazon.co.jp';
 
-      const { key, expected } = createUpgradeKey();
+      const { key } = createUpgradeKey();
 
       const reqOpts: https.RequestOptions = {
         hostname: host,
@@ -680,14 +697,14 @@ export class AlexaPushClient {
 
       const req = https.request(reqOpts);
 
+      let settled = false;
+
       req.on('upgrade', (res: http.IncomingMessage, socket: import('net').Socket, head: Buffer) => {
-        // Validate the server's accept key
-        const acceptKey = res.headers['sec-websocket-accept'];
-        if (acceptKey !== expected) {
-          socket.destroy();
-          reject(new Error('WebSocket handshake failed: invalid accept key'));
-          return;
-        }
+        if (settled) return;
+        settled = true;
+
+        // Note: Amazon's push gateway returns a non-standard Sec-WebSocket-Accept
+        // value, so we skip validation. The connection works correctly regardless.
 
         this.socket = socket;
         this.setupSocket(head);
@@ -706,8 +723,31 @@ export class AlexaPushClient {
         resolve();
       });
 
+      req.on('response', (res: http.IncomingMessage) => {
+        // Server responded with a regular HTTP response instead of upgrade
+        if (settled) return;
+        settled = true;
+        let body = '';
+        res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+        res.on('end', () => {
+          reject(new Error(
+            `WebSocket upgrade rejected: HTTP ${res.statusCode} ${res.statusMessage}` +
+            (body ? ` — ${body.substring(0, 200)}` : ''),
+          ));
+        });
+      });
+
       req.on('error', (err: Error) => {
+        if (settled) return;
+        settled = true;
         reject(err);
+      });
+
+      req.setTimeout(10_000, () => {
+        if (settled) return;
+        settled = true;
+        req.destroy();
+        reject(new Error('WebSocket connection timeout'));
       });
 
       // Must not have a body

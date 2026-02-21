@@ -28,13 +28,13 @@ function encodeNumber(val: number, hexLen = 8): string {
   return '0x' + s;
 }
 
-function toUint32(value: number): number {
+function toUnsigned(value: number): number {
   if (value < 0) return 0xFFFFFFFF + value + 1;
-  return value >>> 0;
+  return value;
 }
 
-function rightShift(value: number, bits: number): number {
-  let v = toUint32(value);
+function shiftRight(value: number, bits: number): number {
+  let v = toUnsigned(value);
   while (bits > 0 && v !== 0) {
     v = Math.floor(v / 2);
     bits--;
@@ -54,18 +54,18 @@ function computeChecksum(buffer: Buffer, excludeStart: number, excludeEnd: numbe
     }
 
     const shiftAmount = ((i & 3) ^ 3) << 3;
-    sum += toUint32(bytes[i] << shiftAmount);
-    carry += rightShift(sum, 32);
-    sum = toUint32(sum & 0xFFFFFFFF);
+    sum += toUnsigned(bytes[i] << shiftAmount);
+    carry += shiftRight(sum, 32);
+    sum = toUnsigned(sum & 0xFFFFFFFF);
   }
 
   while (carry) {
     sum += carry;
-    carry = rightShift(sum, 32);
+    carry = shiftRight(sum, 32);
     sum &= 0xFFFFFFFF;
   }
 
-  return toUint32(sum);
+  return toUnsigned(sum);
 }
 
 function readHex(data: Buffer, index: number, length: number): number {
