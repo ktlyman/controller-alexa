@@ -14,7 +14,7 @@ import type {
   Color,
   ThermostatMode,
 } from './alexa';
-import type { AccountDevice, AccountDeviceCommand } from '../alexa-api/alexa-api-types';
+import type { AccountDevice, AccountDeviceCommand, DeviceStateSnapshot, ActivityRecord } from '../alexa-api/alexa-api-types';
 import type { StoredEvent, EventQuery } from '../events/event-store';
 
 // ---------------------------------------------------------------------------
@@ -33,7 +33,11 @@ export type AgentAction =
   | GetEventStreamAction
   | SetAlexaCookieAction
   | ListAllDevicesAction
-  | ControlAccountDeviceAction;
+  | ControlAccountDeviceAction
+  | PollDeviceStateAction
+  | PollAllStatesAction
+  | GetActivityHistoryAction
+  | QueryStateHistoryAction;
 
 // -- Device actions ---------------------------------------------------------
 
@@ -136,6 +140,50 @@ export interface ControlAccountDeviceAction {
   command: AccountDeviceCommand;
 }
 
+// -- State polling & activity history actions -------------------------------
+
+export interface PollDeviceStateAction {
+  type: 'poll_device_state';
+  /** The entityId (legacyAppliance.entityId from GraphQL) to poll */
+  entityId: string;
+  /** Optional human-readable name for the snapshot */
+  deviceName?: string;
+}
+
+export interface PollAllStatesAction {
+  type: 'poll_all_states';
+  /** Specific entityIds to poll; if omitted, auto-discovers from GraphQL */
+  entityIds?: string[];
+  /** Number of devices per batch (default 10) */
+  batchSize?: number;
+}
+
+export interface GetActivityHistoryAction {
+  type: 'get_activity_history';
+  /** Unix timestamp in ms (default: 7 days ago) */
+  startTimestamp?: number;
+  /** Unix timestamp in ms (default: now) */
+  endTimestamp?: number;
+  /** Max records per page (default: 50) */
+  maxRecords?: number;
+  /** Pagination token from a previous response */
+  nextToken?: string;
+}
+
+export interface QueryStateHistoryAction {
+  type: 'query_state_history';
+  /** Filter by device ID */
+  deviceId?: string;
+  /** ISO-8601 start time */
+  startTime?: string;
+  /** ISO-8601 end time */
+  endTime?: string;
+  /** Max results (default 100) */
+  limit?: number;
+  /** Pagination offset (default 0) */
+  offset?: number;
+}
+
 // -- Event actions ----------------------------------------------------------
 
 export interface QueryEventsAction {
@@ -177,6 +225,10 @@ export type GetEventStreamResult = { streamId: string; status: 'subscribed' };
 export type SetAlexaCookieResult = { stored: boolean; valid: boolean };
 export type ListAllDevicesResult = { devices: AccountDevice[]; deviceCount: number };
 export type ControlAccountDeviceResult = { acknowledged: boolean };
+export type PollDeviceStateResult = { state: DeviceStateSnapshot };
+export type PollAllStatesResult = { states: DeviceStateSnapshot[]; polledCount: number; errorCount: number };
+export type GetActivityHistoryResult = { records: ActivityRecord[]; recordCount: number; nextToken?: string };
+export type QueryStateHistoryResult = { snapshots: DeviceStateSnapshot[]; totalCount: number };
 
 export interface RoutineSummary {
   id: string;

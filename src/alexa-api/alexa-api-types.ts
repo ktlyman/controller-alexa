@@ -190,3 +190,74 @@ export type AccountDeviceCommand =
   | { action: 'pause' }
   | { action: 'next' }
   | { action: 'previous' };
+
+// ---------------------------------------------------------------------------
+// Phoenix state polling (POST /api/phoenix/state)
+// ---------------------------------------------------------------------------
+
+/** Parsed capability state entry from a phoenix/state response. */
+export interface ParsedCapabilityState {
+  namespace: string;
+  name: string;
+  value: unknown;
+  timeOfSample?: string;
+}
+
+/** A polled state snapshot for a single device. */
+export interface DeviceStateSnapshot {
+  deviceId: string;
+  deviceName?: string;
+  capabilities: ParsedCapabilityState[];
+  polledAt: string; // ISO-8601
+  error?: string;
+}
+
+/** Raw phoenix/state response shape. */
+export interface PhoenixStateResponse {
+  deviceStates: Array<{
+    entity: { entityId: string; entityType: string };
+    capabilityStates?: string[]; // JSON-encoded strings that need double-parsing
+    error?: { code: string; message?: string };
+  }>;
+  errors?: Array<{ code: string; message: string }>;
+}
+
+// ---------------------------------------------------------------------------
+// Activity history (POST www.amazon.com/alexa-privacy/apd/rvh/customer-history-records-v2)
+// ---------------------------------------------------------------------------
+
+/** Normalized activity record for local storage. */
+export interface ActivityRecord {
+  id: string;
+  timestamp: string; // ISO-8601
+  deviceSerial?: string;
+  deviceName?: string;
+  deviceType?: string;
+  utteranceText?: string;
+  responseText?: string;
+  utteranceType?: string;
+  raw?: Record<string, unknown>;
+}
+
+/** Raw response from the activity history endpoint. */
+export interface ActivityHistoryResponse {
+  customerHistoryRecords: Array<{
+    recordKey: string;
+    creationTimestamp: number;
+    utteranceType?: string;
+    device?: {
+      deviceName?: string;
+      deviceType?: string;
+      serialNumber?: string;
+    };
+    voiceHistoryRecordItems?: Array<{
+      recordItemKey: string;
+      recordItemType: string;
+      transcriptText?: string;
+      [key: string]: unknown;
+    }>;
+    [key: string]: unknown;
+  }>;
+  encodedRequestToken?: string;
+  nextPageToken?: string;
+}

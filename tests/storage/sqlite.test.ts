@@ -1,10 +1,10 @@
 import path from 'path';
 import fs from 'fs';
-import { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore, SqliteCookieStore } from '../../src/storage/sqlite';
+import { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore, SqliteCookieStore, SqliteDeviceStateStore, SqliteActivityStore } from '../../src/storage/sqlite';
 import type { StoredEvent } from '../../src/events/event-store';
 import type { StoredRoutine } from '../../src/routines/routine-store';
 import type { TokenPair } from '../../src/auth/token-store';
-import type { AlexaCookieCredentials } from '../../src/alexa-api/alexa-api-types';
+import type { AlexaCookieCredentials, DeviceStateSnapshot, ActivityRecord } from '../../src/alexa-api/alexa-api-types';
 
 const TEST_DB = path.join(__dirname, '..', 'test-storage.db');
 
@@ -40,10 +40,13 @@ describe('SqliteStorage', () => {
     expect(fs.existsSync(TEST_DB)).toBe(true);
   });
 
-  it('should provide all three store types', () => {
+  it('should provide all store types', () => {
     expect(storage.events()).toBeInstanceOf(SqliteEventStore);
     expect(storage.routines()).toBeInstanceOf(SqliteRoutineStore);
     expect(storage.tokens()).toBeInstanceOf(SqliteTokenStore);
+    expect(storage.cookies()).toBeInstanceOf(SqliteCookieStore);
+    expect(storage.deviceStates()).toBeInstanceOf(SqliteDeviceStateStore);
+    expect(storage.activities()).toBeInstanceOf(SqliteActivityStore);
   });
 });
 
@@ -372,6 +375,295 @@ describe('SqliteCookieStore', () => {
     const retrieved = await store2.get('user-1');
     expect(retrieved).not.toBeNull();
     expect(retrieved!.cookie).toBe('session-id=abc123; csrf=token456');
+    storage2.close();
+  });
+});
+
+describe('SqliteDeviceStateStore', () => {
+  let storage: SqliteStorage;
+  let store: SqliteDeviceStateStore;
+
+  beforeEach(() => {
+    try { fs.unlinkSync(TEST_DB); } catch {}
+    storage = new SqliteStorage(TEST_DB);
+    store = storage.deviceStates();
+  });
+
+  afterEach(() => {
+    storage.close();
+    try { fs.unlinkSync(TEST_DB); } catch {}
+  });
+
+  const sampleSnapshot: DeviceStateSnapshot = {
+    deviceId: 'entity-1',
+    deviceName: 'Kitchen Light',
+    capabilities: [
+      { namespace: 'Alexa.PowerController', name: 'powerState', value: 'ON' },
+      { namespace: 'Alexa.BrightnessController', name: 'brightness', value: 75 },
+    ],
+    polledAt: '2024-06-01T12:00:00Z',
+  };
+
+  it('should insert and query a snapshot', async () => {
+    await store.insert(sampleSnapshot);
+    const result = await store.query({});
+    expect(result.snapshots).toHaveLength(1);
+    expect(result.totalCount).toBe(1);
+    expect(result.snapshots[0].deviceId).toBe('entity-1');
+    expect(result.snapshots[0].deviceName).toBe('Kitchen Light');
+    expect(result.snapshots[0].capabilities).toHaveLength(2);
+    expect(result.snapshots[0].capabilities[0].value).toBe('ON');
+  });
+
+  it('should insert batch', async () => {
+    await store.insertBatch([
+      { ...sampleSnapshot, deviceId: 'a' },
+      { ...sampleSnapshot, deviceId: 'b' },
+      { ...sampleSnapshot, deviceId: 'c' },
+    ]);
+    const result = await store.query({});
+    expect(result.totalCount).toBe(3);
+  });
+
+  it('should filter by deviceId', async () => {
+    await store.insert({ ...sampleSnapshot, deviceId: 'light-1' });
+    await store.insert({ ...sampleSnapshot, deviceId: 'plug-1' });
+    await store.insert({ ...sampleSnapshot, deviceId: 'light-1', polledAt: '2024-07-01T00:00:00Z' });
+
+    const result = await store.query({ deviceId: 'light-1' });
+    expect(result.totalCount).toBe(2);
+  });
+
+  it('should filter by time range', async () => {
+    await store.insert({ ...sampleSnapshot, polledAt: '2024-01-01T00:00:00Z' });
+    await store.insert({ ...sampleSnapshot, polledAt: '2024-06-15T00:00:00Z' });
+    await store.insert({ ...sampleSnapshot, polledAt: '2024-12-01T00:00:00Z' });
+
+    const result = await store.query({
+      startTime: '2024-03-01T00:00:00Z',
+      endTime: '2024-09-01T00:00:00Z',
+    });
+    expect(result.snapshots).toHaveLength(1);
+    expect(result.snapshots[0].polledAt).toBe('2024-06-15T00:00:00Z');
+  });
+
+  it('should paginate with limit and offset', async () => {
+    for (let i = 0; i < 10; i++) {
+      await store.insert({
+        ...sampleSnapshot,
+        polledAt: `2024-01-${String(i + 1).padStart(2, '0')}T00:00:00Z`,
+      });
+    }
+
+    const page = await store.query({ limit: 3, offset: 0 });
+    expect(page.snapshots).toHaveLength(3);
+    expect(page.totalCount).toBe(10);
+  });
+
+  it('should get latest snapshot for a device', async () => {
+    await store.insert({ ...sampleSnapshot, deviceId: 'light-1', polledAt: '2024-01-01T00:00:00Z' });
+    await store.insert({ ...sampleSnapshot, deviceId: 'light-1', polledAt: '2024-12-01T00:00:00Z' });
+
+    const latest = await store.getLatest('light-1');
+    expect(latest).not.toBeNull();
+    expect(latest!.polledAt).toBe('2024-12-01T00:00:00Z');
+  });
+
+  it('should return null for unknown device in getLatest', async () => {
+    expect(await store.getLatest('nonexistent')).toBeNull();
+  });
+
+  it('should prune old snapshots', async () => {
+    await store.insert({ ...sampleSnapshot, polledAt: '2024-01-01T00:00:00Z' });
+    await store.insert({ ...sampleSnapshot, polledAt: '2024-06-01T00:00:00Z' });
+    await store.insert({ ...sampleSnapshot, polledAt: '2024-12-01T00:00:00Z' });
+
+    const pruned = await store.prune('2024-05-01T00:00:00Z');
+    expect(pruned).toBe(1);
+
+    const result = await store.query({});
+    expect(result.totalCount).toBe(2);
+  });
+
+  it('should store error snapshots', async () => {
+    await store.insert({
+      deviceId: 'broken-1',
+      capabilities: [],
+      polledAt: '2024-06-01T00:00:00Z',
+      error: 'DEVICE_UNREACHABLE',
+    });
+
+    const result = await store.query({ deviceId: 'broken-1' });
+    expect(result.snapshots[0].error).toBe('DEVICE_UNREACHABLE');
+    expect(result.snapshots[0].capabilities).toEqual([]);
+  });
+
+  it('should persist across reopen', async () => {
+    await store.insert(sampleSnapshot);
+    storage.close();
+
+    const storage2 = new SqliteStorage(TEST_DB);
+    const store2 = storage2.deviceStates();
+    const result = await store2.query({ deviceId: 'entity-1' });
+    expect(result.totalCount).toBe(1);
+    expect(result.snapshots[0].capabilities).toHaveLength(2);
+    storage2.close();
+  });
+});
+
+describe('SqliteActivityStore', () => {
+  let storage: SqliteStorage;
+  let store: SqliteActivityStore;
+
+  beforeEach(() => {
+    try { fs.unlinkSync(TEST_DB); } catch {}
+    storage = new SqliteStorage(TEST_DB);
+    store = storage.activities();
+  });
+
+  afterEach(() => {
+    storage.close();
+    try { fs.unlinkSync(TEST_DB); } catch {}
+  });
+
+  const sampleRecord: ActivityRecord = {
+    id: 'rec-1',
+    timestamp: '2024-06-01T12:00:00Z',
+    deviceSerial: 'ECHO-1',
+    deviceName: 'Kitchen Echo',
+    deviceType: 'ECHO_DOT',
+    utteranceText: 'turn on the lights',
+    responseText: 'OK',
+    utteranceType: 'VOICE',
+  };
+
+  it('should insert and query a record', async () => {
+    await store.insert(sampleRecord);
+    const result = await store.query({});
+    expect(result.records).toHaveLength(1);
+    expect(result.totalCount).toBe(1);
+    expect(result.records[0].id).toBe('rec-1');
+    expect(result.records[0].utteranceText).toBe('turn on the lights');
+  });
+
+  it('should deduplicate by id (INSERT OR IGNORE)', async () => {
+    await store.insert(sampleRecord);
+    await store.insert({ ...sampleRecord, utteranceText: 'modified' }); // same id
+
+    const result = await store.query({});
+    expect(result.totalCount).toBe(1);
+    // Should keep the original, not the duplicate
+    expect(result.records[0].utteranceText).toBe('turn on the lights');
+  });
+
+  it('should insert batch with dedup', async () => {
+    await store.insertBatch([
+      { ...sampleRecord, id: 'b1' },
+      { ...sampleRecord, id: 'b2' },
+      { ...sampleRecord, id: 'b1' }, // duplicate
+    ]);
+
+    const result = await store.query({});
+    expect(result.totalCount).toBe(2);
+  });
+
+  it('should filter by deviceSerial', async () => {
+    await store.insert({ ...sampleRecord, id: 'r1', deviceSerial: 'ECHO-1' });
+    await store.insert({ ...sampleRecord, id: 'r2', deviceSerial: 'ECHO-2' });
+    await store.insert({ ...sampleRecord, id: 'r3', deviceSerial: 'ECHO-1' });
+
+    const result = await store.query({ deviceSerial: 'ECHO-1' });
+    expect(result.totalCount).toBe(2);
+  });
+
+  it('should filter by time range', async () => {
+    await store.insert({ ...sampleRecord, id: 'r1', timestamp: '2024-01-01T00:00:00Z' });
+    await store.insert({ ...sampleRecord, id: 'r2', timestamp: '2024-06-15T00:00:00Z' });
+    await store.insert({ ...sampleRecord, id: 'r3', timestamp: '2024-12-01T00:00:00Z' });
+
+    const result = await store.query({
+      startTime: '2024-03-01T00:00:00Z',
+      endTime: '2024-09-01T00:00:00Z',
+    });
+    expect(result.records).toHaveLength(1);
+    expect(result.records[0].id).toBe('r2');
+  });
+
+  it('should search by text (LIKE)', async () => {
+    await store.insert({ ...sampleRecord, id: 'r1', utteranceText: 'turn on the lights', responseText: 'OK' });
+    await store.insert({ ...sampleRecord, id: 'r2', utteranceText: 'what time is it', responseText: "It's 3pm" });
+    await store.insert({ ...sampleRecord, id: 'r3', utteranceText: 'set volume', responseText: 'lights are now off' });
+
+    const result = await store.query({ searchText: 'lights' });
+    expect(result.totalCount).toBe(2);
+  });
+
+  it('should paginate with limit and offset', async () => {
+    for (let i = 0; i < 10; i++) {
+      await store.insert({
+        ...sampleRecord,
+        id: `r-${i}`,
+        timestamp: `2024-01-${String(i + 1).padStart(2, '0')}T00:00:00Z`,
+      });
+    }
+
+    const page = await store.query({ limit: 3, offset: 0 });
+    expect(page.records).toHaveLength(3);
+    expect(page.totalCount).toBe(10);
+  });
+
+  it('should get by id', async () => {
+    await store.insert(sampleRecord);
+    const found = await store.getById('rec-1');
+    expect(found).not.toBeNull();
+    expect(found!.utteranceText).toBe('turn on the lights');
+
+    const missing = await store.getById('nonexistent');
+    expect(missing).toBeNull();
+  });
+
+  it('should prune old records', async () => {
+    await store.insert({ ...sampleRecord, id: 'r1', timestamp: '2024-01-01T00:00:00Z' });
+    await store.insert({ ...sampleRecord, id: 'r2', timestamp: '2024-06-01T00:00:00Z' });
+    await store.insert({ ...sampleRecord, id: 'r3', timestamp: '2024-12-01T00:00:00Z' });
+
+    const pruned = await store.prune('2024-05-01T00:00:00Z');
+    expect(pruned).toBe(1);
+    expect((await store.query({})).totalCount).toBe(2);
+  });
+
+  it('should handle optional fields', async () => {
+    const minimal: ActivityRecord = {
+      id: 'min-1',
+      timestamp: '2024-06-01T00:00:00Z',
+    };
+    await store.insert(minimal);
+    const retrieved = await store.getById('min-1');
+    expect(retrieved).not.toBeNull();
+    expect(retrieved!.deviceSerial).toBeUndefined();
+    expect(retrieved!.utteranceText).toBeUndefined();
+  });
+
+  it('should store and retrieve raw data', async () => {
+    const withRaw: ActivityRecord = {
+      ...sampleRecord,
+      id: 'raw-1',
+      raw: { extra: 'data', nested: { key: 'value' } },
+    };
+    await store.insert(withRaw);
+    const retrieved = await store.getById('raw-1');
+    expect(retrieved!.raw).toEqual({ extra: 'data', nested: { key: 'value' } });
+  });
+
+  it('should persist across reopen', async () => {
+    await store.insert(sampleRecord);
+    storage.close();
+
+    const storage2 = new SqliteStorage(TEST_DB);
+    const store2 = storage2.activities();
+    const result = await store2.getById('rec-1');
+    expect(result).not.toBeNull();
+    expect(result!.utteranceText).toBe('turn on the lights');
     storage2.close();
   });
 });

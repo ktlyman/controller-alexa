@@ -317,4 +317,59 @@ describe('AlexaAgentTool', () => {
       expect(result.error).toContain('No Alexa cookie configured');
     });
   });
+
+  describe('poll_device_state', () => {
+    it('should fail without cookie configured', async () => {
+      const result = await tool.execute({
+        type: 'poll_device_state',
+        entityId: 'entity-1',
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('No Alexa cookie configured');
+    });
+  });
+
+  describe('poll_all_states', () => {
+    it('should fail without cookie configured', async () => {
+      const result = await tool.execute({
+        type: 'poll_all_states',
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('No Alexa cookie configured');
+    });
+  });
+
+  describe('get_activity_history', () => {
+    it('should fail without cookie configured', async () => {
+      const result = await tool.execute({
+        type: 'get_activity_history',
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('No Alexa cookie configured');
+    });
+  });
+
+  describe('query_state_history', () => {
+    it('should return empty results from fresh store', async () => {
+      const result = await tool.execute({
+        type: 'query_state_history',
+      });
+      expect(result.success).toBe(true);
+      expect((result.data as any).snapshots).toEqual([]);
+      expect((result.data as any).totalCount).toBe(0);
+    });
+
+    it('should accept filter parameters', async () => {
+      const result = await tool.execute({
+        type: 'query_state_history',
+        deviceId: 'entity-1',
+        startTime: '2024-01-01T00:00:00Z',
+        endTime: '2024-12-31T23:59:59Z',
+        limit: 10,
+        offset: 0,
+      });
+      expect(result.success).toBe(true);
+      expect((result.data as any).totalCount).toBe(0);
+    });
+  });
 });

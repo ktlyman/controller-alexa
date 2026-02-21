@@ -10,7 +10,9 @@ import type { EventStore, StoredEvent, EventQuery, EventQueryResult } from '../e
 import type { RoutineStore, StoredRoutine } from '../routines/routine-store';
 import type { TokenStore, TokenPair } from '../auth/token-store';
 import type { CookieStore } from '../alexa-api/cookie-store';
-import type { AlexaCookieCredentials } from '../alexa-api/alexa-api-types';
+import type { AlexaCookieCredentials, DeviceStateSnapshot, ActivityRecord } from '../alexa-api/alexa-api-types';
+import type { DeviceStateStore, DeviceStateQuery, DeviceStateQueryResult } from '../alexa-api/device-state-store';
+import type { ActivityStore, ActivityQuery, ActivityQueryResult } from '../alexa-api/activity-store';
 
 export class SqliteStorage {
   private db: Database.Database;
@@ -64,6 +66,32 @@ export class SqliteStorage {
         stored_at TEXT NOT NULL,
         expires_at TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS device_states (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT NOT NULL,
+        device_name TEXT,
+        capabilities TEXT NOT NULL DEFAULT '[]',
+        polled_at TEXT NOT NULL,
+        error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_device_states_device_id ON device_states(device_id);
+      CREATE INDEX IF NOT EXISTS idx_device_states_polled_at ON device_states(polled_at);
+      CREATE INDEX IF NOT EXISTS idx_device_states_device_polled ON device_states(device_id, polled_at);
+
+      CREATE TABLE IF NOT EXISTS activity_history (
+        id TEXT PRIMARY KEY,
+        timestamp TEXT NOT NULL,
+        device_serial TEXT,
+        device_name TEXT,
+        device_type TEXT,
+        utterance_text TEXT,
+        response_text TEXT,
+        utterance_type TEXT,
+        raw TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_history(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_activity_device_serial ON activity_history(device_serial);
     `);
   }
 
@@ -81,6 +109,14 @@ export class SqliteStorage {
 
   cookies(): SqliteCookieStore {
     return new SqliteCookieStore(this.db);
+  }
+
+  deviceStates(): SqliteDeviceStateStore {
+    return new SqliteDeviceStateStore(this.db);
+  }
+
+  activities(): SqliteActivityStore {
+    return new SqliteActivityStore(this.db);
   }
 
   close(): void {
@@ -313,6 +349,203 @@ export class SqliteCookieStore implements CookieStore {
 
 // ---------------------------------------------------------------------------
 // Token store
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Device state store
+// ---------------------------------------------------------------------------
+
+export class SqliteDeviceStateStore implements DeviceStateStore {
+  constructor(private db: Database.Database) {}
+
+  async insert(snapshot: DeviceStateSnapshot): Promise<void> {
+    this.db.prepare(`
+      INSERT INTO device_states (device_id, device_name, capabilities, polled_at, error)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(
+      snapshot.deviceId,
+      snapshot.deviceName ?? null,
+      JSON.stringify(snapshot.capabilities),
+      snapshot.polledAt,
+      snapshot.error ?? null,
+    );
+  }
+
+  async insertBatch(snapshots: DeviceStateSnapshot[]): Promise<void> {
+    const stmt = this.db.prepare(`
+      INSERT INTO device_states (device_id, device_name, capabilities, polled_at, error)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    const tx = this.db.transaction((items: DeviceStateSnapshot[]) => {
+      for (const s of items) {
+        stmt.run(
+          s.deviceId,
+          s.deviceName ?? null,
+          JSON.stringify(s.capabilities),
+          s.polledAt,
+          s.error ?? null,
+        );
+      }
+    });
+    tx(snapshots);
+  }
+
+  async query(query: DeviceStateQuery): Promise<DeviceStateQueryResult> {
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    if (query.deviceId) { conditions.push('device_id = ?'); params.push(query.deviceId); }
+    if (query.startTime) { conditions.push('polled_at >= ?'); params.push(query.startTime); }
+    if (query.endTime) { conditions.push('polled_at <= ?'); params.push(query.endTime); }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const countRow = this.db.prepare(
+      `SELECT COUNT(*) as cnt FROM device_states ${where}`
+    ).get(...params) as { cnt: number };
+
+    const limit = query.limit ?? 100;
+    const offset = query.offset ?? 0;
+
+    const rows = this.db.prepare(
+      `SELECT * FROM device_states ${where} ORDER BY polled_at DESC LIMIT ? OFFSET ?`
+    ).all(...params, limit, offset) as any[];
+
+    return {
+      snapshots: rows.map(rowToDeviceState),
+      totalCount: countRow.cnt,
+    };
+  }
+
+  async getLatest(deviceId: string): Promise<DeviceStateSnapshot | null> {
+    const row = this.db.prepare(
+      'SELECT * FROM device_states WHERE device_id = ? ORDER BY polled_at DESC LIMIT 1'
+    ).get(deviceId) as any;
+    return row ? rowToDeviceState(row) : null;
+  }
+
+  async prune(olderThan: string): Promise<number> {
+    const result = this.db.prepare('DELETE FROM device_states WHERE polled_at < ?').run(olderThan);
+    return result.changes;
+  }
+}
+
+function rowToDeviceState(row: any): DeviceStateSnapshot {
+  return {
+    deviceId: row.device_id,
+    deviceName: row.device_name ?? undefined,
+    capabilities: JSON.parse(row.capabilities),
+    polledAt: row.polled_at,
+    error: row.error ?? undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Activity store
+// ---------------------------------------------------------------------------
+
+export class SqliteActivityStore implements ActivityStore {
+  constructor(private db: Database.Database) {}
+
+  async insert(record: ActivityRecord): Promise<void> {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO activity_history
+        (id, timestamp, device_serial, device_name, device_type, utterance_text, response_text, utterance_type, raw)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      record.id,
+      record.timestamp,
+      record.deviceSerial ?? null,
+      record.deviceName ?? null,
+      record.deviceType ?? null,
+      record.utteranceText ?? null,
+      record.responseText ?? null,
+      record.utteranceType ?? null,
+      record.raw ? JSON.stringify(record.raw) : null,
+    );
+  }
+
+  async insertBatch(records: ActivityRecord[]): Promise<void> {
+    const stmt = this.db.prepare(`
+      INSERT OR IGNORE INTO activity_history
+        (id, timestamp, device_serial, device_name, device_type, utterance_text, response_text, utterance_type, raw)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const tx = this.db.transaction((items: ActivityRecord[]) => {
+      for (const r of items) {
+        stmt.run(
+          r.id, r.timestamp,
+          r.deviceSerial ?? null, r.deviceName ?? null, r.deviceType ?? null,
+          r.utteranceText ?? null, r.responseText ?? null,
+          r.utteranceType ?? null,
+          r.raw ? JSON.stringify(r.raw) : null,
+        );
+      }
+    });
+    tx(records);
+  }
+
+  async query(query: ActivityQuery): Promise<ActivityQueryResult> {
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    if (query.deviceSerial) { conditions.push('device_serial = ?'); params.push(query.deviceSerial); }
+    if (query.startTime) { conditions.push('timestamp >= ?'); params.push(query.startTime); }
+    if (query.endTime) { conditions.push('timestamp <= ?'); params.push(query.endTime); }
+    if (query.searchText) {
+      conditions.push('(utterance_text LIKE ? OR response_text LIKE ?)');
+      const pattern = `%${query.searchText}%`;
+      params.push(pattern, pattern);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const countRow = this.db.prepare(
+      `SELECT COUNT(*) as cnt FROM activity_history ${where}`
+    ).get(...params) as { cnt: number };
+
+    const limit = query.limit ?? 100;
+    const offset = query.offset ?? 0;
+
+    const rows = this.db.prepare(
+      `SELECT * FROM activity_history ${where} ORDER BY timestamp DESC LIMIT ? OFFSET ?`
+    ).all(...params, limit, offset) as any[];
+
+    return {
+      records: rows.map(rowToActivity),
+      totalCount: countRow.cnt,
+    };
+  }
+
+  async getById(id: string): Promise<ActivityRecord | null> {
+    const row = this.db.prepare(
+      'SELECT * FROM activity_history WHERE id = ?'
+    ).get(id) as any;
+    return row ? rowToActivity(row) : null;
+  }
+
+  async prune(olderThan: string): Promise<number> {
+    const result = this.db.prepare('DELETE FROM activity_history WHERE timestamp < ?').run(olderThan);
+    return result.changes;
+  }
+}
+
+function rowToActivity(row: any): ActivityRecord {
+  return {
+    id: row.id,
+    timestamp: row.timestamp,
+    deviceSerial: row.device_serial ?? undefined,
+    deviceName: row.device_name ?? undefined,
+    deviceType: row.device_type ?? undefined,
+    utteranceText: row.utterance_text ?? undefined,
+    responseText: row.response_text ?? undefined,
+    utteranceType: row.utterance_type ?? undefined,
+    raw: row.raw ? JSON.parse(row.raw) : undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Token store (cookie-based)
 // ---------------------------------------------------------------------------
 
 export class SqliteTokenStore implements TokenStore {

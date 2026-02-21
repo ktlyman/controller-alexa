@@ -16,6 +16,11 @@ import type {
   GraphQLEndpointItem,
   AccountDevice,
   AccountDeviceCommand,
+  DeviceStateSnapshot,
+  ParsedCapabilityState,
+  PhoenixStateResponse,
+  ActivityRecord,
+  ActivityHistoryResponse,
 } from './alexa-api-types';
 import { ALEXA_API_BASE_URLS } from './alexa-api-types';
 
@@ -283,6 +288,136 @@ export class AlexaApiClient {
   }
 
   /**
+   * Poll device states via the phoenix/state API.
+   * POST /api/phoenix/state
+   *
+   * The entityIds should be `legacyAppliance.entityId` values from GraphQL,
+   * NOT the endpointId. Returns parsed capability states for each device.
+   */
+  async getDeviceStates(
+    entityIds: string[],
+    deviceNameMap?: Map<string, string>,
+  ): Promise<DeviceStateSnapshot[]> {
+    this.requireCredentials();
+
+    const stateRequests = entityIds.map((entityId) => ({
+      entityId,
+      entityType: 'APPLIANCE',
+    }));
+
+    const body = JSON.stringify({ stateRequests });
+    const response = await this.request('POST', '/api/phoenix/state', body);
+    const data = this.parseJsonResponse(response) as PhoenixStateResponse;
+
+    const polledAt = new Date().toISOString();
+    const snapshots: DeviceStateSnapshot[] = [];
+
+    for (const ds of data.deviceStates ?? []) {
+      const deviceId = ds.entity?.entityId;
+      if (!deviceId) continue;
+
+      if (ds.error) {
+        snapshots.push({
+          deviceId,
+          deviceName: deviceNameMap?.get(deviceId),
+          capabilities: [],
+          polledAt,
+          error: `${ds.error.code}: ${ds.error.message ?? 'unknown'}`,
+        });
+        continue;
+      }
+
+      // capabilityStates are JSON-encoded strings that need double-parsing
+      const capabilities: ParsedCapabilityState[] = [];
+      for (const raw of ds.capabilityStates ?? []) {
+        try {
+          const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          capabilities.push({
+            namespace: parsed.namespace ?? '',
+            name: parsed.name ?? '',
+            value: parsed.value,
+            timeOfSample: parsed.timeOfSample,
+          });
+        } catch {
+          // Skip malformed capability states
+        }
+      }
+
+      snapshots.push({
+        deviceId,
+        deviceName: deviceNameMap?.get(deviceId),
+        capabilities,
+        polledAt,
+      });
+    }
+
+    return snapshots;
+  }
+
+  /**
+   * Fetch voice activity history from the privacy endpoint.
+   * POST https://www.amazon.com/alexa-privacy/apd/rvh/customer-history-records-v2
+   *
+   * Note: This endpoint lives on www.amazon.com, NOT alexa.amazon.com.
+   */
+  async getActivityHistory(params?: {
+    startTimestamp?: number;
+    endTimestamp?: number;
+    maxRecordSize?: number;
+    nextToken?: string;
+  }): Promise<{ records: ActivityRecord[]; nextToken?: string }> {
+    this.requireCredentials();
+
+    const now = Date.now();
+    const body = JSON.stringify({
+      previousRequestToken: params?.nextToken ?? null,
+      startTimestamp: params?.startTimestamp ?? now - 7 * 24 * 60 * 60 * 1000,
+      endTimestamp: params?.endTimestamp ?? now,
+      maxRecordSize: params?.maxRecordSize ?? 50,
+    });
+
+    const response = await this.request(
+      'POST',
+      '/alexa-privacy/apd/rvh/customer-history-records-v2',
+      body,
+      { baseUrl: 'https://www.amazon.com' },
+    );
+    const data = this.parseJsonResponse(response) as ActivityHistoryResponse;
+
+    const records: ActivityRecord[] = [];
+    for (const entry of data.customerHistoryRecords ?? []) {
+      // Extract utterance and response text from voice history items
+      let utteranceText: string | undefined;
+      let responseText: string | undefined;
+
+      for (const item of entry.voiceHistoryRecordItems ?? []) {
+        if (item.recordItemType === 'CUSTOMER_TRANSCRIPT' || item.recordItemType === 'ASR_REPLACEMENT_TEXT') {
+          utteranceText = utteranceText ?? item.transcriptText;
+        } else if (item.recordItemType === 'ALEXA_RESPONSE' || item.recordItemType === 'TTS_REPLACEMENT_TEXT') {
+          responseText = responseText ?? item.transcriptText;
+        }
+      }
+
+      records.push({
+        id: entry.recordKey,
+        timestamp: new Date(entry.creationTimestamp).toISOString(),
+        deviceSerial: entry.device?.serialNumber,
+        deviceName: entry.device?.deviceName,
+        deviceType: entry.device?.deviceType,
+        utteranceText,
+        responseText,
+        utteranceType: entry.utteranceType,
+        raw: entry as unknown as Record<string, unknown>,
+      });
+    }
+
+    return {
+      records,
+      nextToken: data.encodedRequestToken ?? data.nextPageToken,
+    };
+  }
+
+  /**
    * Verify the cookie is still valid by hitting a lightweight endpoint.
    */
   async validateCookie(): Promise<boolean> {
@@ -491,9 +626,14 @@ export class AlexaApiClient {
   }
 
   /** Low-level HTTPS request, mirroring the pattern in LwaOAuthClient. */
-  private request(method: string, path: string, body?: string): Promise<HttpResponse> {
+  private request(
+    method: string,
+    path: string,
+    body?: string,
+    opts?: { baseUrl?: string },
+  ): Promise<HttpResponse> {
     return new Promise((resolve, reject) => {
-      const url = new URL(path, this.baseUrl);
+      const url = new URL(path, opts?.baseUrl ?? this.baseUrl);
 
       // The /nexus/v1/graphql endpoint requires a mobile-app User-Agent
       const isGraphQL = path.startsWith('/nexus/');

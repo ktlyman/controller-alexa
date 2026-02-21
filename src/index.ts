@@ -25,11 +25,16 @@ export type { EventStore, StoredEvent, EventQuery, EventQueryResult, EventListen
 export { createHandler } from './lambda';
 export type { LambdaContext } from './lambda';
 
-export { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore, SqliteCookieStore } from './storage';
+export { SqliteStorage, SqliteEventStore, SqliteRoutineStore, SqliteTokenStore, SqliteCookieStore, SqliteDeviceStateStore, SqliteActivityStore } from './storage';
 
 // Unofficial Alexa API
-export { AlexaApiClient, InMemoryCookieStore } from './alexa-api';
-export type { CookieStore, AlexaCookieCredentials, AccountDevice, AccountDeviceCommand, AlexaApiRegion } from './alexa-api';
+export { AlexaApiClient, InMemoryCookieStore, InMemoryDeviceStateStore, InMemoryActivityStore } from './alexa-api';
+export type {
+  CookieStore, AlexaCookieCredentials, AccountDevice, AccountDeviceCommand, AlexaApiRegion,
+  DeviceStateStore, DeviceStateQuery, DeviceStateQueryResult,
+  ActivityStore, ActivityQuery, ActivityQueryResult,
+  ParsedCapabilityState, DeviceStateSnapshot, ActivityRecord,
+} from './alexa-api';
 
 export { loadConfig } from './config';
 export type { AlexaAgentConfig } from './config';
@@ -73,4 +78,12 @@ export type {
   SetAlexaCookieResult,
   ListAllDevicesResult,
   ControlAccountDeviceResult,
+  PollDeviceStateAction,
+  PollAllStatesAction,
+  GetActivityHistoryAction,
+  QueryStateHistoryAction,
+  PollDeviceStateResult,
+  PollAllStatesResult,
+  GetActivityHistoryResult,
+  QueryStateHistoryResult,
 } from './types/agent';

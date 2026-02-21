@@ -435,6 +435,217 @@ describe('AlexaApiClient', () => {
     });
   });
 
+  describe('getDeviceStates', () => {
+    beforeEach(() => {
+      client.setCredentials({
+        cookie: 'session=abc',
+        csrf: 'tok',
+        storedAt: new Date().toISOString(),
+      });
+    });
+
+    it('should throw without credentials', async () => {
+      const noCredClient = new AlexaApiClient('NA');
+      await expect(noCredClient.getDeviceStates(['e1'])).rejects.toThrow('No Alexa cookie');
+    });
+
+    it('should parse phoenix state with double-encoded capabilityStates', async () => {
+      const phoenixResponse = {
+        deviceStates: [
+          {
+            entity: { entityId: 'entity-1', entityType: 'APPLIANCE' },
+            capabilityStates: [
+              JSON.stringify({ namespace: 'Alexa.PowerController', name: 'powerState', value: 'ON', timeOfSample: '2024-06-01T00:00:00Z' }),
+              JSON.stringify({ namespace: 'Alexa.BrightnessController', name: 'brightness', value: 75 }),
+            ],
+          },
+        ],
+      };
+
+      mockResponse(200, JSON.stringify(phoenixResponse));
+
+      const result = await client.getDeviceStates(['entity-1']);
+      expect(result).toHaveLength(1);
+      expect(result[0].deviceId).toBe('entity-1');
+      expect(result[0].capabilities).toHaveLength(2);
+      expect(result[0].capabilities[0].namespace).toBe('Alexa.PowerController');
+      expect(result[0].capabilities[0].value).toBe('ON');
+      expect(result[0].capabilities[1].value).toBe(75);
+      expect(result[0].error).toBeUndefined();
+    });
+
+    it('should handle device errors in response', async () => {
+      const phoenixResponse = {
+        deviceStates: [
+          {
+            entity: { entityId: 'unreachable-1', entityType: 'APPLIANCE' },
+            error: { code: 'DEVICE_UNREACHABLE', message: 'Device not responding' },
+          },
+        ],
+      };
+
+      mockResponse(200, JSON.stringify(phoenixResponse));
+
+      const result = await client.getDeviceStates(['unreachable-1']);
+      expect(result).toHaveLength(1);
+      expect(result[0].error).toContain('DEVICE_UNREACHABLE');
+      expect(result[0].capabilities).toEqual([]);
+    });
+
+    it('should handle malformed capability states gracefully', async () => {
+      const phoenixResponse = {
+        deviceStates: [
+          {
+            entity: { entityId: 'entity-1', entityType: 'APPLIANCE' },
+            capabilityStates: [
+              JSON.stringify({ namespace: 'Alexa.PowerController', name: 'powerState', value: 'ON' }),
+              'not-valid-json{{{',
+            ],
+          },
+        ],
+      };
+
+      mockResponse(200, JSON.stringify(phoenixResponse));
+
+      const result = await client.getDeviceStates(['entity-1']);
+      expect(result).toHaveLength(1);
+      // Only the valid one should be parsed
+      expect(result[0].capabilities).toHaveLength(1);
+      expect(result[0].capabilities[0].value).toBe('ON');
+    });
+
+    it('should apply deviceNameMap', async () => {
+      const phoenixResponse = {
+        deviceStates: [
+          {
+            entity: { entityId: 'entity-1', entityType: 'APPLIANCE' },
+            capabilityStates: [],
+          },
+        ],
+      };
+
+      mockResponse(200, JSON.stringify(phoenixResponse));
+
+      const nameMap = new Map([['entity-1', 'Kitchen Light']]);
+      const result = await client.getDeviceStates(['entity-1'], nameMap);
+      expect(result[0].deviceName).toBe('Kitchen Light');
+    });
+  });
+
+  describe('getActivityHistory', () => {
+    beforeEach(() => {
+      client.setCredentials({
+        cookie: 'session=abc',
+        csrf: 'tok',
+        storedAt: new Date().toISOString(),
+      });
+    });
+
+    it('should throw without credentials', async () => {
+      const noCredClient = new AlexaApiClient('NA');
+      await expect(noCredClient.getActivityHistory()).rejects.toThrow('No Alexa cookie');
+    });
+
+    it('should parse activity history records', async () => {
+      const historyResponse = {
+        customerHistoryRecords: [
+          {
+            recordKey: 'rec-1',
+            creationTimestamp: 1704067200000, // 2024-01-01T00:00:00Z
+            utteranceType: 'VOICE',
+            device: {
+              deviceName: 'Echo Dot',
+              deviceType: 'ECHO_DOT',
+              serialNumber: 'SERIAL1',
+            },
+            voiceHistoryRecordItems: [
+              { recordItemKey: 'item-1', recordItemType: 'CUSTOMER_TRANSCRIPT', transcriptText: 'turn on the lights' },
+              { recordItemKey: 'item-2', recordItemType: 'ALEXA_RESPONSE', transcriptText: 'OK' },
+            ],
+          },
+        ],
+        encodedRequestToken: 'next-page-token',
+      };
+
+      mockResponse(200, JSON.stringify(historyResponse));
+
+      const result = await client.getActivityHistory();
+      expect(result.records).toHaveLength(1);
+      expect(result.records[0].id).toBe('rec-1');
+      expect(result.records[0].utteranceText).toBe('turn on the lights');
+      expect(result.records[0].responseText).toBe('OK');
+      expect(result.records[0].deviceSerial).toBe('SERIAL1');
+      expect(result.records[0].deviceName).toBe('Echo Dot');
+      expect(result.nextToken).toBe('next-page-token');
+    });
+
+    it('should use www.amazon.com as base URL', async () => {
+      mockResponse(200, JSON.stringify({ customerHistoryRecords: [] }));
+
+      await client.getActivityHistory();
+
+      const reqCall = (mockHttps.request as jest.Mock).mock.calls[0];
+      expect(reqCall[0].hostname).toBe('www.amazon.com');
+      expect(reqCall[0].path).toContain('/alexa-privacy/');
+    });
+
+    it('should pass pagination token', async () => {
+      let capturedBody = '';
+      (mockHttps.request as jest.Mock).mockImplementationOnce((_opts: any, callback: any) => {
+        const res = new EventEmitter() as any;
+        res.statusCode = 200;
+        res.headers = {};
+        const req = new EventEmitter() as any;
+        req.write = jest.fn((data: string) => { capturedBody = data; });
+        req.end = jest.fn(() => {
+          process.nextTick(() => {
+            callback(res);
+            res.emit('data', JSON.stringify({ customerHistoryRecords: [] }));
+            res.emit('end');
+          });
+        });
+        return req;
+      });
+
+      await client.getActivityHistory({ nextToken: 'page-2-token' });
+
+      const body = JSON.parse(capturedBody);
+      expect(body.previousRequestToken).toBe('page-2-token');
+    });
+
+    it('should default to 7-day window', async () => {
+      let capturedBody = '';
+      (mockHttps.request as jest.Mock).mockImplementationOnce((_opts: any, callback: any) => {
+        const res = new EventEmitter() as any;
+        res.statusCode = 200;
+        res.headers = {};
+        const req = new EventEmitter() as any;
+        req.write = jest.fn((data: string) => { capturedBody = data; });
+        req.end = jest.fn(() => {
+          process.nextTick(() => {
+            callback(res);
+            res.emit('data', JSON.stringify({ customerHistoryRecords: [] }));
+            res.emit('end');
+          });
+        });
+        return req;
+      });
+
+      const before = Date.now();
+      await client.getActivityHistory();
+      const after = Date.now();
+
+      const body = JSON.parse(capturedBody);
+      // endTimestamp should be roughly now
+      expect(body.endTimestamp).toBeGreaterThanOrEqual(before);
+      expect(body.endTimestamp).toBeLessThanOrEqual(after);
+      // startTimestamp should be roughly 7 days ago
+      const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+      expect(body.startTimestamp).toBeGreaterThanOrEqual(before - sevenDaysMs - 1000);
+      expect(body.startTimestamp).toBeLessThanOrEqual(after - sevenDaysMs + 1000);
+    });
+  });
+
   describe('validateCookie', () => {
     it('should return false without credentials', async () => {
       const valid = await client.validateCookie();

@@ -27,6 +27,10 @@ import type { TokenStore } from '../auth/token-store';
 import { AlexaApiClient, InMemoryCookieStore } from '../alexa-api';
 import type { CookieStore } from '../alexa-api';
 import type { AlexaCookieCredentials, AlexaApiRegion, AccountDeviceCommand } from '../alexa-api';
+import { InMemoryDeviceStateStore } from '../alexa-api/device-state-store';
+import type { DeviceStateStore } from '../alexa-api/device-state-store';
+import { InMemoryActivityStore } from '../alexa-api/activity-store';
+import type { ActivityStore } from '../alexa-api/activity-store';
 import type {
   AgentAction,
   AgentToolResult,
@@ -42,6 +46,10 @@ import type {
   SetAlexaCookieResult,
   ListAllDevicesResult,
   ControlAccountDeviceResult,
+  PollDeviceStateResult,
+  PollAllStatesResult,
+  GetActivityHistoryResult,
+  QueryStateHistoryResult,
 } from '../types/agent';
 
 export class AlexaAgentTool {
@@ -54,10 +62,15 @@ export class AlexaAgentTool {
   private eventGateway: EventGatewayClient;
   private alexaApi: AlexaApiClient;
   private cookieStore: CookieStore;
+  private deviceStateStore: DeviceStateStore;
+  private activityStore: ActivityStore;
   private cleanup?: () => void;
 
   /** The user ID for the current session. */
   private userId: string;
+
+  /** Timestamp of the last poll_all_states call (rate limiting). */
+  private lastPollAllTime = 0;
 
   constructor(opts?: {
     config?: Partial<AlexaAgentConfig>;
@@ -67,6 +80,8 @@ export class AlexaAgentTool {
     routineStore?: RoutineStore;
     tokenStore?: TokenStore;
     cookieStore?: CookieStore;
+    deviceStateStore?: DeviceStateStore;
+    activityStore?: ActivityStore;
   }) {
     this.config = loadConfig(opts?.config);
     this.userId = opts?.userId ?? 'default-user';
@@ -75,6 +90,8 @@ export class AlexaAgentTool {
     let routineStore = opts?.routineStore;
     let tokenStore = opts?.tokenStore;
     let cookieStore = opts?.cookieStore;
+    let deviceStateStore = opts?.deviceStateStore;
+    let activityStore = opts?.activityStore;
 
     // Auto-create SQLite stores when configured and no override provided
     if (this.config.storageBackend === 'sqlite' && (!eventStore || !routineStore || !tokenStore || !cookieStore)) {
@@ -86,6 +103,8 @@ export class AlexaAgentTool {
       routineStore = routineStore ?? storage.routines();
       tokenStore = tokenStore ?? storage.tokens();
       cookieStore = cookieStore ?? storage.cookies();
+      deviceStateStore = deviceStateStore ?? storage.deviceStates();
+      activityStore = activityStore ?? storage.activities();
       this.cleanup = () => storage.close();
     }
 
@@ -96,6 +115,8 @@ export class AlexaAgentTool {
     this.eventLogger = new EventLogger(eventStore ?? new InMemoryEventStore(this.config.maxInMemoryEvents));
     this.eventGateway = new EventGatewayClient(this.config.region);
     this.cookieStore = cookieStore ?? new InMemoryCookieStore();
+    this.deviceStateStore = deviceStateStore ?? new InMemoryDeviceStateStore();
+    this.activityStore = activityStore ?? new InMemoryActivityStore();
     this.alexaApi = new AlexaApiClient(this.config.region as AlexaApiRegion);
   }
 
@@ -171,6 +192,18 @@ export class AlexaAgentTool {
           break;
         case 'control_account_device':
           data = await this.controlAccountDevice(action.deviceId, action.deviceType, action.command);
+          break;
+        case 'poll_device_state':
+          data = await this.pollDeviceState(action.entityId, action.deviceName);
+          break;
+        case 'poll_all_states':
+          data = await this.pollAllStates(action.entityIds, action.batchSize);
+          break;
+        case 'get_activity_history':
+          data = await this.getActivityHistory(action.startTimestamp, action.endTimestamp, action.maxRecords, action.nextToken);
+          break;
+        case 'query_state_history':
+          data = await this.queryStateHistory(action.deviceId, action.startTime, action.endTime, action.limit, action.offset);
           break;
         default: {
           const _exhaustive: never = action;
@@ -462,6 +495,186 @@ export class AlexaAgentTool {
     });
 
     return { acknowledged: true };
+  }
+
+  // -----------------------------------------------------------------------
+  // State polling & activity history actions
+  // -----------------------------------------------------------------------
+
+  private async pollDeviceState(
+    entityId: string,
+    deviceName?: string,
+  ): Promise<PollDeviceStateResult> {
+    await this.ensureCookieLoaded();
+
+    const nameMap = deviceName ? new Map([[entityId, deviceName]]) : undefined;
+    const snapshots = await this.alexaApi.getDeviceStates([entityId], nameMap);
+    const state = snapshots[0] ?? {
+      deviceId: entityId,
+      deviceName,
+      capabilities: [],
+      polledAt: new Date().toISOString(),
+      error: 'No state returned from API',
+    };
+
+    await this.deviceStateStore.insert(state);
+
+    await this.eventLogger.logCustomEvent({
+      eventType: 'AgentPollDeviceState',
+      namespace: 'AlexaAgentTool',
+      endpointId: entityId,
+      userId: this.userId,
+      payload: { capabilityCount: state.capabilities.length, hasError: !!state.error },
+      tags: ['agent_action', 'state_polling', 'account_api'],
+    });
+
+    return { state };
+  }
+
+  private async pollAllStates(
+    entityIds?: string[],
+    batchSize = 10,
+  ): Promise<PollAllStatesResult> {
+    await this.ensureCookieLoaded();
+
+    // Rate limiting: minimum 5 minutes between full polls
+    const RATE_LIMIT_MS = 5 * 60 * 1000;
+    const elapsed = Date.now() - this.lastPollAllTime;
+    if (elapsed < RATE_LIMIT_MS) {
+      const waitSec = Math.ceil((RATE_LIMIT_MS - elapsed) / 1000);
+      throw new Error(
+        `Rate limited: poll_all_states can only run every 5 minutes. ` +
+        `Please wait ${waitSec} more seconds.`,
+      );
+    }
+
+    // Auto-discover entityIds from GraphQL if not provided
+    let ids = entityIds;
+    if (!ids || ids.length === 0) {
+      const endpoints = await this.alexaApi.getSmartHomeEndpoints();
+      ids = [];
+      const nameMap = new Map<string, string>();
+      for (const ep of endpoints) {
+        const eid = ep.legacyAppliance?.entityId;
+        if (eid) {
+          ids.push(eid);
+          nameMap.set(eid, ep.friendlyName ?? eid);
+        }
+      }
+    }
+
+    if (ids.length === 0) {
+      return { states: [], polledCount: 0, errorCount: 0 };
+    }
+
+    // Build name map for all entityIds
+    const nameMap = new Map<string, string>();
+    if (!entityIds || entityIds.length === 0) {
+      // nameMap was built above during auto-discovery but scoped — rebuild
+      const endpoints = await this.alexaApi.getSmartHomeEndpoints();
+      for (const ep of endpoints) {
+        const eid = ep.legacyAppliance?.entityId;
+        if (eid) nameMap.set(eid, ep.friendlyName ?? eid);
+      }
+    }
+
+    const allSnapshots: import('../alexa-api/alexa-api-types').DeviceStateSnapshot[] = [];
+    let errorCount = 0;
+
+    // Process in batches with 1-second delays between batches
+    for (let i = 0; i < ids.length; i += batchSize) {
+      if (i > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+      const batch = ids.slice(i, i + batchSize);
+      try {
+        const snapshots = await this.alexaApi.getDeviceStates(batch, nameMap);
+        allSnapshots.push(...snapshots);
+        errorCount += snapshots.filter((s) => s.error).length;
+      } catch {
+        // Mark all in batch as errors
+        for (const eid of batch) {
+          allSnapshots.push({
+            deviceId: eid,
+            deviceName: nameMap.get(eid),
+            capabilities: [],
+            polledAt: new Date().toISOString(),
+            error: 'Batch request failed',
+          });
+          errorCount++;
+        }
+      }
+    }
+
+    // Persist all snapshots
+    if (allSnapshots.length > 0) {
+      await this.deviceStateStore.insertBatch(allSnapshots);
+    }
+
+    this.lastPollAllTime = Date.now();
+
+    await this.eventLogger.logCustomEvent({
+      eventType: 'AgentPollAllStates',
+      namespace: 'AlexaAgentTool',
+      userId: this.userId,
+      payload: { polledCount: allSnapshots.length, errorCount },
+      tags: ['agent_action', 'state_polling', 'account_api'],
+    });
+
+    return { states: allSnapshots, polledCount: allSnapshots.length, errorCount };
+  }
+
+  private async getActivityHistory(
+    startTimestamp?: number,
+    endTimestamp?: number,
+    maxRecords?: number,
+    nextToken?: string,
+  ): Promise<GetActivityHistoryResult> {
+    await this.ensureCookieLoaded();
+
+    const result = await this.alexaApi.getActivityHistory({
+      startTimestamp,
+      endTimestamp,
+      maxRecordSize: maxRecords,
+      nextToken,
+    });
+
+    // Persist records
+    if (result.records.length > 0) {
+      await this.activityStore.insertBatch(result.records);
+    }
+
+    await this.eventLogger.logCustomEvent({
+      eventType: 'AgentGetActivityHistory',
+      namespace: 'AlexaAgentTool',
+      userId: this.userId,
+      payload: { recordCount: result.records.length, hasNextToken: !!result.nextToken },
+      tags: ['agent_action', 'activity_history', 'account_api'],
+    });
+
+    return {
+      records: result.records,
+      recordCount: result.records.length,
+      nextToken: result.nextToken,
+    };
+  }
+
+  private async queryStateHistory(
+    deviceId?: string,
+    startTime?: string,
+    endTime?: string,
+    limit?: number,
+    offset?: number,
+  ): Promise<QueryStateHistoryResult> {
+    const result = await this.deviceStateStore.query({
+      deviceId,
+      startTime,
+      endTime,
+      limit,
+      offset,
+    });
+
+    return { snapshots: result.snapshots, totalCount: result.totalCount };
   }
 
   /**
