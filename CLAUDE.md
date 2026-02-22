@@ -59,3 +59,60 @@
 - You MUST add tests in `tests/` that mirror the `src/` directory structure
 - You SHOULD test both in-memory and SQLite store implementations for storage changes
 - You MUST NOT use real Alexa API credentials in tests; instead use mock tokens and in-memory stores
+
+## Resolving Opaque Alexa API Metadata
+
+The Alexa API frequently uses opaque or numeric identifiers where you might expect descriptive strings. When the frontend displays raw IDs, fallback icons, or generic labels instead of meaningful data, follow this workflow:
+
+### The Problem Pattern
+
+Alexa API responses often contain **opaque instance IDs** (e.g., `"4"`, `"5"`) or **encoded capability names** that don't match naive substring checks. You cannot assume instance strings will be human-readable — the same capability might be `"humidity"` on one device and `"4"` on another.
+
+### Resolution Workflow
+
+1. **Inspect the live SQLite database** to see what the API actually returns:
+   ```bash
+   sqlite3 ./alexa-agent.db "SELECT capabilities FROM device_states WHERE device_name = 'DEVICE_NAME' ORDER BY polled_at DESC LIMIT 1;"
+   ```
+   This reveals the actual instance strings, namespaces, and value shapes.
+
+2. **Query the device discovery data** via the running server to see the full raw capability metadata:
+   ```bash
+   curl -s http://localhost:3100/action -H 'Content-Type: application/json' \
+     -d '{"type":"list_all_devices","source":"smart_home"}' | python3 -c "
+   import json, sys
+   data = json.load(sys.stdin)
+   for dev in data['data']['devices']:
+       if 'DEVICE_NAME' in dev.get('name', ''):
+           raw = dev.get('raw', {}).get('legacyAppliance', {})
+           for cap in raw.get('capabilities', []):
+               print(json.dumps(cap, indent=2))
+   "
+   ```
+   The GraphQL discovery response includes **deeply nested metadata** that the Phoenix state API does not — particularly `resources.friendlyNames`, `semantics.stateMappings`, and `configuration` blocks.
+
+3. **Look for semantic metadata in these locations** (in priority order):
+   - `resources.friendlyNames[].value.assetId` — Alexa asset IDs like `Alexa.AirQuality.Humidity`, `Alexa.AirQuality.ParticulateMatter`
+   - `resources.friendlyNames[].value.text` — Plain text names like `"Particulate matter PM10"`
+   - `configuration.unitOfMeasure` — Unit strings like `Alexa.Unit.Percent`, `Alexa.Unit.PartsPerMillion`
+   - `semantics.stateMappings[].states` — State labels like `Alexa.States.Detection.VOC.Good`
+   - The instance string itself (only reliable when it's descriptive, not numeric)
+
+4. **Propagate the semantic name** from discovery time (GraphQL/`getAllDevices()`) through to the frontend. Store it on `RangeCapabilityConfig.friendlyName` (or equivalent) so the rendering layer can match on it instead of the opaque instance ID.
+
+### Known Alexa Asset ID Patterns
+
+These are the asset IDs observed from real devices. Match against the **lowercased** asset ID since casing can vary:
+
+| Asset ID | Meaning | Icon | Unit |
+|---|---|---|---|
+| `alexa.airquality.humidity` | Humidity | 💧 | % |
+| `alexa.airquality.particulatematter` | PM2.5 | 🌫️ | µg/m³ |
+| `alexa.airquality.volatileorganiccompounds` | VOC Index | 🍃 | idx |
+| `alexa.airquality.carbonmonoxide` | CO | ⚠️ | ppm |
+| `alexa.airquality.indoorairquality` | IAQ Score | 🎯 | (unitless) |
+| Text: `"Particulate matter PM10"` | PM10 | 🌫️ | µg/m³ |
+
+### Key Lesson
+
+Never assume Alexa capability instance strings are descriptive. Always extract and propagate semantic metadata from the **discovery response** (which is richer) to the **state rendering layer** (which only sees the instance ID). When adding support for a new device type or capability, start by inspecting the raw discovery data to understand the actual field naming convention before writing matching logic.
