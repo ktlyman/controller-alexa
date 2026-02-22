@@ -52,6 +52,7 @@ import type {
   ControlAccountDeviceResult,
   PollDeviceStateResult,
   PollAllStatesResult,
+  GetCachedStatesResult,
   GetActivityHistoryResult,
   QueryStateHistoryResult,
   StartPushListenerResult,
@@ -209,13 +210,22 @@ export class AlexaAgentTool {
           data = await this.listAllDevices(action.source, action.deviceType);
           break;
         case 'control_account_device':
-          data = await this.controlAccountDevice(action.deviceId, action.deviceType, action.command);
+          data = await this.controlAccountDevice(
+            action.deviceId, action.deviceType, action.command,
+            action.source, action.entityId, action.alexaDeviceType,
+          );
           break;
         case 'poll_device_state':
-          data = await this.pollDeviceState(action.entityId, action.deviceName);
+          data = await this.pollDeviceState(
+            action.applianceId ?? action.entityId,
+            action.deviceName,
+          );
           break;
         case 'poll_all_states':
           data = await this.pollAllStates(action.entityIds, action.batchSize);
+          break;
+        case 'get_cached_states':
+          data = await this.getCachedStates();
           break;
         case 'get_activity_history':
           data = await this.getActivityHistory(action.startTimestamp, action.endTimestamp, action.maxRecords, action.nextToken);
@@ -507,17 +517,59 @@ export class AlexaAgentTool {
     deviceId: string,
     deviceType: string,
     command: AccountDeviceCommand,
+    source?: 'smart_home' | 'echo',
+    entityId?: string,
+    alexaDeviceType?: string,
   ): Promise<ControlAccountDeviceResult> {
     await this.ensureCookieLoaded();
 
-    await this.alexaApi.sendCommand({ deviceId, deviceType, command });
+    // Determine if this is a smart home device that needs the SmartHome.Batch API.
+    // Smart home devices have endpoint IDs like "amzn1.alexa.endpoint.xxx" and
+    // need the Alexa.SmartHome.Batch format. Echo devices use serial numbers
+    // and the Alexa.DeviceControls.* format.
+    const isSmartHome = source === 'smart_home'
+      || deviceId.startsWith('amzn1.alexa.endpoint.');
+
+    if (isSmartHome) {
+      // For smart home devices, use the entity ID if available, otherwise
+      // try to look it up from the device list, or fall back to the device ID itself.
+      let targetEntityId = entityId;
+      if (!targetEntityId) {
+        // Try to find the entity ID by querying devices
+        try {
+          const endpoints = await this.alexaApi.getSmartHomeEndpoints();
+          const ep = endpoints.find(
+            (e) => (e.id ?? e.endpointId) === deviceId,
+          );
+          targetEntityId = ep?.legacyAppliance?.entityId;
+        } catch {
+          // Ignore lookup failures — fall back to deviceId
+        }
+      }
+
+      if (!targetEntityId) {
+        // Last resort: use the deviceId directly (may work for some devices)
+        targetEntityId = deviceId;
+      }
+
+      await this.alexaApi.sendSmartHomeCommand({
+        entityId: targetEntityId,
+        command,
+      });
+    } else {
+      // For Echo devices, the behaviors API needs the Alexa product type code
+      // (e.g. 'A3S5BH2HU6VAYF'), NOT the device family ('ECHO', 'KNIGHT').
+      // alexaDeviceType carries the product code; deviceType is the display category.
+      const apiDeviceType = alexaDeviceType || deviceType;
+      await this.alexaApi.sendCommand({ deviceId, deviceType: apiDeviceType, command });
+    }
 
     await this.eventLogger.logCustomEvent({
       eventType: 'AgentControlAccountDevice',
       namespace: 'AlexaAgentTool',
       endpointId: deviceId,
       userId: this.userId,
-      payload: { command },
+      payload: { command, source: isSmartHome ? 'smart_home' : 'echo' },
       tags: ['agent_action', 'device_control', 'account_api'],
     });
 
@@ -560,7 +612,7 @@ export class AlexaAgentTool {
 
   private async pollAllStates(
     entityIds?: string[],
-    batchSize = 10,
+    batchSize = 50,
   ): Promise<PollAllStatesResult> {
     await this.ensureCookieLoaded();
 
@@ -575,17 +627,22 @@ export class AlexaAgentTool {
       );
     }
 
-    // Auto-discover entityIds from GraphQL if not provided
+    // Auto-discover applianceIds from the normalized device list.
+    // The phoenix/state API requires legacyAppliance.applianceId — NOT the
+    // entityId (UUID) or endpointId (amzn1.alexa.endpoint...).
+    //
+    // Only poll smart_home devices — Echo-source devices don't support
+    // phoenix/state queries and would all return ENDPOINT_UNREACHABLE.
+    const nameMap = new Map<string, string>();
     let ids = entityIds;
     if (!ids || ids.length === 0) {
-      const endpoints = await this.alexaApi.getSmartHomeEndpoints();
+      const devices = await this.alexaApi.getAllDevices();
       ids = [];
-      const nameMap = new Map<string, string>();
-      for (const ep of endpoints) {
-        const eid = ep.legacyAppliance?.entityId;
-        if (eid) {
-          ids.push(eid);
-          nameMap.set(eid, ep.friendlyName ?? eid);
+      for (const d of devices) {
+        const aid = d.applianceId;
+        if (aid && d.source === 'smart_home') {
+          ids.push(aid);
+          nameMap.set(aid, d.name);
         }
       }
     }
@@ -594,24 +651,14 @@ export class AlexaAgentTool {
       return { states: [], polledCount: 0, errorCount: 0 };
     }
 
-    // Build name map for all entityIds
-    const nameMap = new Map<string, string>();
-    if (!entityIds || entityIds.length === 0) {
-      // nameMap was built above during auto-discovery but scoped — rebuild
-      const endpoints = await this.alexaApi.getSmartHomeEndpoints();
-      for (const ep of endpoints) {
-        const eid = ep.legacyAppliance?.entityId;
-        if (eid) nameMap.set(eid, ep.friendlyName ?? eid);
-      }
-    }
-
     const allSnapshots: import('../alexa-api/alexa-api-types').DeviceStateSnapshot[] = [];
     let errorCount = 0;
 
-    // Process in batches with 1-second delays between batches
+    // Process in batches — the phoenix API handles large batches well,
+    // so we use a large batch size (50) with a short delay between batches.
     for (let i = 0; i < ids.length; i += batchSize) {
       if (i > 0) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await new Promise((resolve) => setTimeout(resolve, 200));
       }
       const batch = ids.slice(i, i + batchSize);
       try {
@@ -620,10 +667,10 @@ export class AlexaAgentTool {
         errorCount += snapshots.filter((s) => s.error).length;
       } catch {
         // Mark all in batch as errors
-        for (const eid of batch) {
+        for (const aid of batch) {
           allSnapshots.push({
-            deviceId: eid,
-            deviceName: nameMap.get(eid),
+            deviceId: aid,
+            deviceName: nameMap.get(aid),
             capabilities: [],
             polledAt: new Date().toISOString(),
             error: 'Batch request failed',
@@ -649,6 +696,18 @@ export class AlexaAgentTool {
     });
 
     return { states: allSnapshots, polledCount: allSnapshots.length, errorCount };
+  }
+
+  private async getCachedStates(): Promise<GetCachedStatesResult> {
+    const states = await this.deviceStateStore.getAllLatest();
+    // Find the most recent polledAt across all snapshots
+    let cachedAt: string | undefined;
+    for (const s of states) {
+      if (!cachedAt || s.polledAt > cachedAt) {
+        cachedAt = s.polledAt;
+      }
+    }
+    return { states, stateCount: states.length, cachedAt };
   }
 
   private async getActivityHistory(

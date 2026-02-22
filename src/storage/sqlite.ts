@@ -446,6 +446,19 @@ export class SqliteDeviceStateStore implements DeviceStateStore {
     return row ? rowToDeviceState(row) : null;
   }
 
+  async getAllLatest(): Promise<DeviceStateSnapshot[]> {
+    // Use a subquery to find the max polled_at for each device_id, then join back
+    const rows = this.db.prepare(`
+      SELECT ds.* FROM device_states ds
+      INNER JOIN (
+        SELECT device_id, MAX(polled_at) AS max_polled_at
+        FROM device_states
+        GROUP BY device_id
+      ) latest ON ds.device_id = latest.device_id AND ds.polled_at = latest.max_polled_at
+    `).all() as any[];
+    return rows.map(rowToDeviceState);
+  }
+
   async prune(olderThan: string): Promise<number> {
     const result = this.db.prepare('DELETE FROM device_states WHERE polled_at < ?').run(olderThan);
     return result.changes;

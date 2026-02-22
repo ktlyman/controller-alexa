@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Alexa Controller</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <!-- Header -->
+  <header id="header">
+    <div class="header-left">
+      <h1>Alexa Controller</h1>
+    </div>
+    <div class="header-right">
+      <span id="cookie-status" class="status-badge" title="Cookie status">
+        <span class="status-dot"></span>
+        <span class="status-text">Checking...</span>
+      </span>
+      <span id="push-status" class="status-badge" title="Push listener status">
+        <span class="status-dot"></span>
+        <span class="status-text">Disconnected</span>
+      </span>
+    </div>
+  </header>
+
+  <!-- Tab navigation -->
+  <nav id="tab-nav">
+    <a href="#devices" class="tab-link active" data-tab="devices">
+      <span class="tab-icon">&#x1F4A1;</span> Devices
+    </a>
+    <a href="#routines" class="tab-link" data-tab="routines">
+      <span class="tab-icon">&#x26A1;</span> Routines
+    </a>
+    <a href="#logs" class="tab-link" data-tab="logs">
+      <span class="tab-icon">&#x1F4CB;</span> Logs
+    </a>
+    <a href="#live" class="tab-link" data-tab="live">
+      <span class="tab-icon">&#x1F4E1;</span> Live Events
+      <span id="live-count" class="badge hidden">0</span>
+    </a>
+  </nav>
+
+  <!-- Tab panels -->
+  <main id="main-content">
+    <!-- Devices Tab -->
+    <section id="tab-devices" class="tab-panel active">
+      <div class="toolbar">
+        <input type="text" id="device-search" class="search-input" placeholder="Search devices...">
+        <select id="device-source-filter" class="filter-select">
+          <option value="all">All Sources</option>
+          <option value="smart_home">Smart Home</option>
+          <option value="echo">Echo</option>
+        </select>
+        <select id="device-type-filter" class="filter-select">
+          <option value="">All Types</option>
+        </select>
+        <select id="device-group-filter" class="filter-select">
+          <option value="">All Rooms</option>
+        </select>
+        <button id="device-refresh-btn" class="btn btn-secondary" title="Refresh devices">&#x21BB; Refresh</button>
+        <button id="device-poll-btn" class="btn btn-primary" title="Poll all device states">&#x1F50D; Poll States</button>
+        <button id="auto-poll-btn" class="btn btn-sm btn-secondary" title="Auto-poll disabled (click to enable)" onclick="toggleAutoPoll()">&#x23F1;&#xFE0F; Auto</button>
+        <button id="device-edit-btn" class="btn btn-secondary" title="Edit device groups">&#x270F;&#xFE0F; Edit</button>
+      </div>
+      <div id="device-count" class="result-count"></div>
+      <div id="device-grid" class="device-grid">
+        <div class="loading-placeholder">Loading devices...</div>
+      </div>
+    </section>
+
+    <!-- Routines Tab -->
+    <section id="tab-routines" class="tab-panel">
+      <div class="toolbar">
+        <button id="routine-refresh-btn" class="btn btn-secondary">&#x21BB; Refresh</button>
+        <button id="routine-create-btn" class="btn btn-primary">+ Create Routine</button>
+      </div>
+      <div id="routine-create-form" class="routine-form hidden">
+        <div class="form-group">
+          <label>Routine Name</label>
+          <input type="text" id="routine-name" placeholder="e.g. Good Night" class="form-input">
+        </div>
+        <div class="form-group">
+          <label>Trigger phrase (what you say to Alexa)</label>
+          <input type="text" id="routine-trigger" placeholder="e.g. good night" class="form-input">
+        </div>
+        <div class="form-group">
+          <label>Actions (one per line — format: deviceId:action or speak:text)</label>
+          <textarea id="routine-actions" rows="4" class="form-input" placeholder="e.g.&#10;speak:Good night, turning off the lights&#10;amzn1.alexa.endpoint.xxx:turn_off"></textarea>
+        </div>
+        <div class="form-actions">
+          <button id="routine-save-btn" class="btn btn-primary">Save Routine</button>
+          <button id="routine-cancel-btn" class="btn btn-secondary">Cancel</button>
+        </div>
+      </div>
+      <div id="routine-list" class="routine-list">
+        <div class="loading-placeholder">Loading routines...</div>
+      </div>
+    </section>
+
+    <!-- Logs Tab -->
+    <section id="tab-logs" class="tab-panel">
+      <div class="sub-tabs">
+        <button class="sub-tab active" data-subtab="events">Events</button>
+        <button class="sub-tab" data-subtab="activity">Activity History</button>
+        <button class="sub-tab" data-subtab="push-events">Push Events</button>
+      </div>
+
+      <!-- Events sub-tab — unified device timeline -->
+      <div id="subtab-events" class="subtab-panel active">
+        <div class="toolbar">
+          <div class="time-range-buttons">
+            <button class="btn btn-sm time-btn active" data-range="1h">1h</button>
+            <button class="btn btn-sm time-btn" data-range="24h">24h</button>
+            <button class="btn btn-sm time-btn" data-range="7d">7d</button>
+            <button class="btn btn-sm time-btn" data-range="all">All</button>
+          </div>
+          <select id="event-device-filter" class="filter-select">
+            <option value="">All Devices</option>
+          </select>
+          <select id="event-kind-filter" class="filter-select">
+            <option value="">All Events</option>
+            <option value="state">State Changes</option>
+            <option value="action">Actions Taken</option>
+            <option value="push">Push Events</option>
+          </select>
+          <button id="events-refresh-btn" class="btn btn-secondary">&#x21BB;</button>
+          <label class="auto-refresh-label">
+            <input type="checkbox" id="events-auto-refresh"> Auto
+          </label>
+        </div>
+        <div id="events-table" class="log-table"></div>
+        <div id="events-pagination" class="pagination"></div>
+      </div>
+
+      <!-- Activity sub-tab -->
+      <div id="subtab-activity" class="subtab-panel">
+        <div class="toolbar">
+          <div class="time-range-buttons">
+            <button class="btn btn-sm time-btn active" data-range="24h">24h</button>
+            <button class="btn btn-sm time-btn" data-range="7d">7d</button>
+            <button class="btn btn-sm time-btn" data-range="30d">30d</button>
+            <button class="btn btn-sm time-btn" data-range="all">All</button>
+          </div>
+          <input type="text" id="activity-search" class="search-input" placeholder="Search utterances...">
+          <button id="activity-refresh-btn" class="btn btn-secondary">&#x21BB;</button>
+        </div>
+        <div id="activity-table" class="log-table"></div>
+        <div id="activity-pagination" class="pagination"></div>
+      </div>
+
+      <!-- Push Events sub-tab -->
+      <div id="subtab-push-events" class="subtab-panel">
+        <div class="toolbar">
+          <div class="time-range-buttons">
+            <button class="btn btn-sm time-btn active" data-range="1h">1h</button>
+            <button class="btn btn-sm time-btn" data-range="24h">24h</button>
+            <button class="btn btn-sm time-btn" data-range="7d">7d</button>
+            <button class="btn btn-sm time-btn" data-range="all">All</button>
+          </div>
+          <select id="push-event-command-filter" class="filter-select">
+            <option value="">All Commands</option>
+            <option value="PUSH_ACTIVITY">PUSH_ACTIVITY</option>
+            <option value="PUSH_CONTENT_FOCUS_CHANGE">PUSH_CONTENT_FOCUS_CHANGE</option>
+            <option value="PUSH_DOPPLER_CONNECTION_CHANGE">PUSH_DOPPLER_CONNECTION_CHANGE</option>
+            <option value="PUSH_AUDIO_PLAYER_STATE">PUSH_AUDIO_PLAYER_STATE</option>
+            <option value="PUSH_VOLUME_CHANGE">PUSH_VOLUME_CHANGE</option>
+            <option value="PUSH_NOTIFICATION_CHANGE">PUSH_NOTIFICATION_CHANGE</option>
+            <option value="PUSH_BLUETOOTH_STATE_CHANGE">PUSH_BLUETOOTH_STATE_CHANGE</option>
+            <option value="PUSH_MEDIA_CHANGE">PUSH_MEDIA_CHANGE</option>
+            <option value="PUSH_MEDIA_PROGRESS_CHANGE">PUSH_MEDIA_PROGRESS_CHANGE</option>
+          </select>
+          <button id="push-events-refresh-btn" class="btn btn-secondary">&#x21BB;</button>
+        </div>
+        <div id="push-events-table" class="log-table"></div>
+        <div id="push-events-pagination" class="pagination"></div>
+      </div>
+    </section>
+
+    <!-- Live Events Tab -->
+    <section id="tab-live" class="tab-panel">
+      <div class="toolbar">
+        <button id="push-toggle-btn" class="btn btn-primary">&#x1F50C; Connect Listener</button>
+        <button id="live-pause-btn" class="btn btn-secondary">&#x23F8; Pause</button>
+        <button id="live-clear-btn" class="btn btn-secondary">&#x1F5D1; Clear</button>
+        <select id="live-command-filter" class="filter-select">
+          <option value="">All Events</option>
+          <option value="PUSH_ACTIVITY">PUSH_ACTIVITY</option>
+          <option value="PUSH_CONTENT_FOCUS_CHANGE">PUSH_CONTENT_FOCUS_CHANGE</option>
+          <option value="PUSH_DOPPLER_CONNECTION_CHANGE">PUSH_DOPPLER_CONNECTION_CHANGE</option>
+          <option value="PUSH_AUDIO_PLAYER_STATE">PUSH_AUDIO_PLAYER_STATE</option>
+          <option value="PUSH_VOLUME_CHANGE">PUSH_VOLUME_CHANGE</option>
+          <option value="PUSH_NOTIFICATION_CHANGE">PUSH_NOTIFICATION_CHANGE</option>
+          <option value="PUSH_BLUETOOTH_STATE_CHANGE">PUSH_BLUETOOTH_STATE_CHANGE</option>
+          <option value="PUSH_MEDIA_CHANGE">PUSH_MEDIA_CHANGE</option>
+          <option value="PUSH_MEDIA_PROGRESS_CHANGE">PUSH_MEDIA_PROGRESS_CHANGE</option>
+        </select>
+        <input type="text" id="live-device-filter" class="search-input" placeholder="Filter device...">
+      </div>
+      <div id="live-stats" class="live-stats">
+        <span id="live-event-count">0 events</span>
+        <span id="live-sse-status" class="sse-status">SSE: connecting...</span>
+      </div>
+      <div id="live-feed" class="live-feed">
+        <div class="empty-state">
+          <p>No live events yet.</p>
+          <p class="text-muted">Connect the push listener and interact with your Alexa devices to see events appear here in real-time.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Device Control Modal -->
+  <div id="device-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 id="modal-device-name"></h2>
+        <button id="modal-close" class="btn-icon" title="Close">&times;</button>
+      </div>
+      <div id="modal-device-info" class="modal-info"></div>
+      <div id="modal-controls" class="modal-controls"></div>
+      <div id="modal-history" class="modal-history"></div>
+      <div id="modal-state" class="modal-state"></div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

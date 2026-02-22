@@ -26,6 +26,8 @@ export interface AlexaAgentConfig {
   localServerPort: number;
   /** Log level */
   logLevel: 'debug' | 'info' | 'warn' | 'error';
+  /** Auto-poll interval in minutes (0 = disabled). Polls all device states periodically. */
+  autoPollIntervalMinutes: number;
 }
 
 export function loadConfig(overrides: Partial<AlexaAgentConfig> = {}): AlexaAgentConfig {
@@ -39,6 +41,7 @@ export function loadConfig(overrides: Partial<AlexaAgentConfig> = {}): AlexaAgen
     maxInMemoryEvents: parseInt(process.env.MAX_MEMORY_EVENTS ?? '10000', 10),
     localServerPort: parseInt(process.env.LOCAL_SERVER_PORT ?? '3100', 10),
     logLevel: (process.env.LOG_LEVEL as AlexaAgentConfig['logLevel']) ?? 'info',
+    autoPollIntervalMinutes: parseInt(process.env.AUTO_POLL_INTERVAL_MINUTES ?? '10', 10),
     ...overrides,
   };
 }

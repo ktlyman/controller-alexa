@@ -9,16 +9,22 @@
 ## Architecture
 
 - `src/agent/alexa-agent-tool.ts` is the main entry point agents call via `execute(action)`
+- `src/alexa-api/alexa-api-client.ts` is the cookie-based HTTP client for the unofficial Alexa Web API (GraphQL discovery, Phoenix state polling, device commands, activity history)
+- `src/alexa-api/alexa-api-types.ts` defines types for `AccountDevice`, `DeviceStateSnapshot`, `ParsedCapabilityState`, `RangeCapabilityConfig`, and API response shapes
+- `src/alexa-api/device-state-store.ts` defines the `DeviceStateStore` interface and in-memory implementation for polled state snapshots
+- `src/alexa-api/push-client.ts` implements the `AlexaPushClient` WebSocket connection for real-time push events
 - `src/auth/` handles LWA OAuth2 flows: code exchange, token refresh, and storage
 - `src/devices/` contains the device registry and directive builder for Smart Home API v3
 - `src/routines/` manages routine CRUD and Alexa Custom Triggers API integration
 - `src/events/` provides the event logger, event store interface, and Event Gateway client
-- `src/storage/sqlite.ts` implements persistent SQLite-backed stores for all three data types
+- `src/storage/sqlite.ts` implements persistent SQLite-backed stores for all seven data types (events, routines, tokens, cookies, device states, activities, push events)
 - `src/lambda/handler.ts` is the Smart Home Skill Lambda that processes Alexa directives
 - `src/lambda/proxy.ts` is the minimal Lambda proxy that forwards directives to your local server
-- `src/server.ts` is the local HTTP server exposing `/directive` and `/action` endpoints
+- `src/server.ts` is the local HTTP server exposing `/directive`, `/action`, `/events` (SSE), `/state-history`, `/auto-poll`, and static file serving for the web dashboard
+- `src/config/index.ts` defines `AlexaAgentConfig` including `autoPollIntervalMinutes`
 - `src/types/alexa.ts` defines the Alexa Smart Home API v3 message types
 - `src/types/agent.ts` defines the agent action discriminated union and result types
+- `public/` contains the web dashboard (vanilla HTML/CSS/JS): `index.html`, `app.js`, `styles.css`
 
 ## Code Standards
 

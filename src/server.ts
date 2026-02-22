@@ -11,6 +11,8 @@
  */
 
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
 import { loadConfig } from './config';
 import { AlexaAgentTool } from './agent';
 import type { AlexaMessage } from './types/alexa';
@@ -28,6 +30,127 @@ const handler = createHandler({
   deviceController: tool.getDeviceController(),
   eventLogger: tool.getEventLogger(),
 });
+
+// ---------------------------------------------------------------------------
+// Static file serving
+// ---------------------------------------------------------------------------
+
+const publicDir = path.resolve(__dirname, '..', 'public');
+
+const MIME_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.json': 'application/json',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+};
+
+function serveStaticFile(reqUrl: string, res: http.ServerResponse): boolean {
+  let urlPath = reqUrl.split('?')[0]; // strip query string
+  if (urlPath === '/') urlPath = '/index.html';
+
+  // Security: prevent directory traversal
+  const filePath = path.resolve(publicDir, '.' + urlPath);
+  if (!filePath.startsWith(publicDir)) {
+    return false;
+  }
+
+  try {
+    if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+      return false;
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+    const content = fs.readFileSync(filePath);
+    res.writeHead(200, { 'Content-Type': contentType });
+    res.end(content);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-poll timer
+// ---------------------------------------------------------------------------
+
+let autoPollTimer: ReturnType<typeof setInterval> | null = null;
+let autoPollIntervalMs = config.autoPollIntervalMinutes * 60 * 1000;
+
+function startAutoPoll(intervalMs?: number): void {
+  stopAutoPoll();
+  const ms = intervalMs ?? autoPollIntervalMs;
+  if (ms <= 0) return;
+  autoPollIntervalMs = ms;
+  autoPollTimer = setInterval(async () => {
+    try {
+      console.log(`  Auto-poll: polling all states...`);
+      const result = await tool.execute({ type: 'poll_all_states' });
+      if (result.success) {
+        const d = result.data as { polledCount: number; errorCount: number };
+        console.log(`  Auto-poll: ${d.polledCount} devices (${d.errorCount} unreachable)`);
+        broadcastSSE('auto-poll', { polledCount: d.polledCount, errorCount: d.errorCount, timestamp: new Date().toISOString() });
+      } else {
+        console.log(`  Auto-poll: ${result.error}`);
+      }
+    } catch (err) {
+      console.log(`  Auto-poll: failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, ms);
+}
+
+function stopAutoPoll(): void {
+  if (autoPollTimer) {
+    clearInterval(autoPollTimer);
+    autoPollTimer = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Server-Sent Events (SSE) for real-time push events
+// ---------------------------------------------------------------------------
+
+const sseClients = new Set<http.ServerResponse>();
+
+function broadcastSSE(event: string, data: unknown): void {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(payload);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}
+
+// Subscribe to all events from the EventLogger and forward to SSE clients
+tool.getEventLogger().subscribe((event) => {
+  broadcastSSE('event', event);
+});
+
+// Periodic push-status heartbeat for SSE clients
+setInterval(() => {
+  if (sseClients.size === 0) return;
+  const pushClient = tool.getPushClient();
+  const status = pushClient
+    ? {
+        connected: pushClient.isConnected(),
+        state: pushClient.getState(),
+        connectionId: pushClient.getConnectionId(),
+        lastEventTime: pushClient.getLastEventTime()
+          ? new Date(pushClient.getLastEventTime()!).toISOString()
+          : null,
+        eventCount: pushClient.getEventCount(),
+      }
+    : { connected: false, state: 'disconnected', connectionId: null, lastEventTime: null, eventCount: 0 };
+  broadcastSSE('push-status', status);
+}, 5000);
+
+// ---------------------------------------------------------------------------
+// HTTP request handler
+// ---------------------------------------------------------------------------
 
 const server = http.createServer(async (req, res) => {
   // Health check
@@ -71,6 +194,22 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Server-Sent Events endpoint for real-time push events
+  if (req.method === 'GET' && req.url === '/events/stream') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.write(':ok\n\n');
+    sseClients.add(res);
+    req.on('close', () => {
+      sseClients.delete(res);
+    });
+    return;
+  }
+
   // Alexa directive endpoint — the Lambda proxy POSTs here
   if (req.method === 'POST' && req.url === '/directive') {
     let body = '';
@@ -107,6 +246,73 @@ const server = http.createServer(async (req, res) => {
       }
     });
     return;
+  }
+
+  // Auto-poll status & control
+  if (req.method === 'GET' && req.url === '/auto-poll') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      enabled: autoPollTimer !== null,
+      intervalMs: autoPollIntervalMs,
+      intervalMinutes: Math.round(autoPollIntervalMs / 60000),
+    }));
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/auto-poll') {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', () => {
+      try {
+        const { enabled, intervalMinutes } = JSON.parse(body);
+        if (typeof intervalMinutes === 'number' && intervalMinutes > 0) {
+          autoPollIntervalMs = intervalMinutes * 60 * 1000;
+        }
+        if (enabled === false) {
+          stopAutoPoll();
+        } else if (enabled === true) {
+          startAutoPoll(autoPollIntervalMs);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          enabled: autoPollTimer !== null,
+          intervalMs: autoPollIntervalMs,
+          intervalMinutes: Math.round(autoPollIntervalMs / 60000),
+        }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+      }
+    });
+    return;
+  }
+
+  // State history query — used by the frontend to get historical readings for sparklines
+  if (req.method === 'GET' && req.url?.startsWith('/state-history')) {
+    const url = new URL(req.url, `http://localhost:${port}`);
+    const deviceId = url.searchParams.get('deviceId') || undefined;
+    const limit = parseInt(url.searchParams.get('limit') || '20', 10);
+    const startTime = url.searchParams.get('startTime') || undefined;
+
+    try {
+      const result = await tool.execute({
+        type: 'query_state_history',
+        deviceId,
+        startTime,
+        limit,
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result.success ? result.data : { error: result.error }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+    }
+    return;
+  }
+
+  // Static file serving (frontend)
+  if (req.method === 'GET' && req.url) {
+    if (serveStaticFile(req.url, res)) return;
   }
 
   res.writeHead(404);
@@ -239,17 +445,58 @@ server.listen(port, () => {
   console.log(`Alexa Agent Tool server running on http://localhost:${port}`);
   console.log(`  Storage: ${config.storageBackend}${config.storageBackend === 'sqlite' ? ` (${config.sqlitePath})` : ''}`);
   console.log(`  Endpoints:`);
-  console.log(`    POST /directive  — receives forwarded Alexa directives`);
-  console.log(`    POST /action     — receives agent tool actions`);
-  console.log(`    GET  /health     — health check`);
+  console.log(`    GET  /              — web frontend`);
+  console.log(`    GET  /events/stream — SSE real-time event stream`);
+  console.log(`    POST /directive     — receives forwarded Alexa directives`);
+  console.log(`    POST /action        — receives agent tool actions`);
+  console.log(`    GET  /health        — health check`);
   console.log(`    GET  /cookie-status — unofficial API cookie status`);
   console.log(`    GET  /push-status   — push listener connection status`);
   console.log(`    GET  /extract-cookie — browser-based cookie extraction page`);
+
+  // Auto-start push listener if a cookie is already stored,
+  // then auto-poll device states in the background so the frontend
+  // can render cached states immediately on first page load.
+  (async () => {
+    try {
+      const result = await tool.execute({ type: 'start_push_listener' });
+      if (result.success) {
+        console.log(`  Push listener: connected`);
+      } else {
+        console.log(`  Push listener: ${result.error}`);
+      }
+    } catch (err) {
+      console.log(`  Push listener: not started (no cookie configured)`);
+    }
+
+    // Background poll — runs after push listener setup so we don't
+    // delay server startup.  Fire-and-forget; errors are logged but
+    // don't crash the server.
+    try {
+      console.log(`  Background poll: starting...`);
+      const pollResult = await tool.execute({ type: 'poll_all_states' });
+      if (pollResult.success) {
+        const d = pollResult.data as { polledCount: number; errorCount: number };
+        console.log(`  Background poll: ${d.polledCount} devices polled (${d.errorCount} unreachable)`);
+      } else {
+        console.log(`  Background poll: ${pollResult.error}`);
+      }
+    } catch (err) {
+      console.log(`  Background poll: failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Start auto-poll timer (continues polling at the configured interval)
+    if (config.autoPollIntervalMinutes > 0) {
+      startAutoPoll();
+      console.log(`  Auto-poll: every ${config.autoPollIntervalMinutes} minutes`);
+    }
+  })();
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\nShutting down...');
+  stopAutoPoll();
   tool.close();
   server.close();
   process.exit(0);

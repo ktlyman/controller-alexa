@@ -33,6 +33,8 @@ export interface DeviceStateStore {
   insertBatch(snapshots: DeviceStateSnapshot[]): Promise<void>;
   query(query: DeviceStateQuery): Promise<DeviceStateQueryResult>;
   getLatest(deviceId: string): Promise<DeviceStateSnapshot | null>;
+  /** Return the most recent snapshot for every device_id in the store. */
+  getAllLatest(): Promise<DeviceStateSnapshot[]>;
   prune(olderThan: string): Promise<number>;
 }
 
@@ -84,6 +86,16 @@ export class InMemoryDeviceStateStore implements DeviceStateStore {
 
   async getLatest(deviceId: string): Promise<DeviceStateSnapshot | null> {
     return this.snapshots.find((s) => s.deviceId === deviceId) ?? null;
+  }
+
+  async getAllLatest(): Promise<DeviceStateSnapshot[]> {
+    const seen = new Map<string, DeviceStateSnapshot>();
+    for (const s of this.snapshots) {
+      if (!seen.has(s.deviceId)) {
+        seen.set(s.deviceId, s);
+      }
+    }
+    return Array.from(seen.values());
   }
 
   async prune(olderThan: string): Promise<number> {

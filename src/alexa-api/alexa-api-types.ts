@@ -149,7 +149,7 @@ export interface GraphQLEndpointItem {
  * Combines smart home entities, Echo devices, and group info.
  */
 export interface AccountDevice {
-  /** Unique identifier (entityId for smart home, serialNumber for Echo) */
+  /** Unique identifier (endpointId for smart home, serialNumber for Echo) */
   id: string;
   /** Human-readable name */
   name: string;
@@ -165,12 +165,33 @@ export interface AccountDevice {
   model?: string;
   /** The skill that owns this device, if applicable */
   skillId?: string;
-  /** Supported capabilities (e.g., 'Alexa.PowerController') */
+  /** Supported capabilities as operation names (e.g., 'turnOn', 'setBrightness') */
   capabilities: string[];
+  /** Alexa Smart Home interface names (e.g., 'Alexa.PowerController', 'Alexa.ContactSensor') */
+  interfaces: string[];
+  /** Human-readable description from the skill (e.g., "Sensor by Ring", "Pan-Tilt Indoor Cam") */
+  description?: string;
   /** Group memberships */
   groups?: string[];
+  /** Legacy appliance entityId (UUID) — used for smart home directive routing */
+  entityId?: string;
+  /** Legacy applianceId — used for phoenix/state polling (the only ID format the phoenix API accepts) */
+  applianceId?: string;
+  /** Alexa product type code (e.g. 'A3S5BH2HU6VAYF') — needed for Echo API commands */
+  alexaDeviceType?: string;
+  /** Range configuration extracted from discovery (min/max/step per instance) */
+  rangeCapabilities?: RangeCapabilityConfig[];
   /** Raw data from the API (for advanced use) */
   raw?: Record<string, unknown>;
+}
+
+/** Configuration for a RangeController instance, extracted from device discovery. */
+export interface RangeCapabilityConfig {
+  instance: string;
+  minimumValue?: number;
+  maximumValue?: number;
+  precision?: number;
+  unitOfMeasure?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +221,7 @@ export interface ParsedCapabilityState {
   namespace: string;
   name: string;
   value: unknown;
+  instance?: string;
   timeOfSample?: string;
 }
 
@@ -219,7 +241,13 @@ export interface PhoenixStateResponse {
     capabilityStates?: string[]; // JSON-encoded strings that need double-parsing
     error?: { code: string; message?: string };
   }>;
-  errors?: Array<{ code: string; message: string }>;
+  /** Top-level errors for devices that couldn't be queried at all */
+  errors?: Array<{
+    entity?: { entityId: string; entityType: string };
+    code: string;
+    message?: string;
+    data?: unknown;
+  }>;
 }
 
 // ---------------------------------------------------------------------------

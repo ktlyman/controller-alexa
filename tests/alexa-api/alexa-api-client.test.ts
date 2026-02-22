@@ -355,6 +355,9 @@ describe('AlexaApiClient', () => {
     });
 
     it('should build turn_on payload', async () => {
+      // First call: getCustomerId() → bootstrap
+      mockResponse(200, JSON.stringify({ authentication: { customerId: 'CUST123' } }));
+      // Second call: the actual behaviors/preview request
       mockResponse(200, '{}');
 
       await client.sendCommand({
@@ -363,14 +366,17 @@ describe('AlexaApiClient', () => {
         command: { action: 'turn_on' },
       });
 
-      // Verify the request was made
-      expect(mockHttps.request).toHaveBeenCalled();
-      const reqCall = (mockHttps.request as jest.Mock).mock.calls[0];
+      // Verify the behaviors request was made (second call)
+      expect(mockHttps.request).toHaveBeenCalledTimes(2);
+      const reqCall = (mockHttps.request as jest.Mock).mock.calls[1];
       expect(reqCall[0].method).toBe('POST');
-      expect(reqCall[0].path).toContain('/api/behaviors/operation');
+      expect(reqCall[0].path).toContain('/api/behaviors/preview');
     });
 
     it('should build set_brightness payload', async () => {
+      // First call: getCustomerId() → bootstrap
+      mockResponse(200, JSON.stringify({ authentication: { customerId: 'CUST123' } }));
+      // Second call: behaviors/preview — capture the body
       let capturedBody = '';
       (mockHttps.request as jest.Mock).mockImplementationOnce((_opts: any, callback: any) => {
         const res = new EventEmitter() as any;
@@ -392,11 +398,14 @@ describe('AlexaApiClient', () => {
 
       const body = JSON.parse(capturedBody);
       const sequence = JSON.parse(body.sequenceJson);
-      expect(sequence.startNode.operationPayload.type).toBe('Alexa.DeviceControls.Brightness');
+      expect(sequence.startNode.type).toBe('Alexa.DeviceControls.Brightness');
       expect(sequence.startNode.operationPayload.brightness).toBe(75);
     });
 
     it('should build speak payload', async () => {
+      // First call: getCustomerId() → bootstrap
+      mockResponse(200, JSON.stringify({ authentication: { customerId: 'CUST123' } }));
+      // Second call: behaviors/preview — capture the body
       let capturedBody = '';
       (mockHttps.request as jest.Mock).mockImplementationOnce((_opts: any, callback: any) => {
         const res = new EventEmitter() as any;
@@ -418,11 +427,14 @@ describe('AlexaApiClient', () => {
 
       const body = JSON.parse(capturedBody);
       const sequence = JSON.parse(body.sequenceJson);
-      expect(sequence.startNode.operationPayload.type).toBe('Alexa.Speak');
+      expect(sequence.startNode.type).toBe('Alexa.Speak');
       expect(sequence.startNode.operationPayload.textToSpeak).toBe('Hello world');
     });
 
     it('should throw on error response', async () => {
+      // First call: getCustomerId() → bootstrap
+      mockResponse(200, JSON.stringify({ authentication: { customerId: 'CUST123' } }));
+      // Second call: behaviors/preview returns error
       mockResponse(400, 'Bad Request');
 
       await expect(

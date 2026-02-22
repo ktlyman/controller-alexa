@@ -21,6 +21,7 @@ import type {
   PhoenixStateResponse,
   ActivityRecord,
   ActivityHistoryResponse,
+  RangeCapabilityConfig,
 } from './alexa-api-types';
 import { ALEXA_API_BASE_URLS } from './alexa-api-types';
 
@@ -89,6 +90,7 @@ interface HttpResponse {
 export class AlexaApiClient {
   private baseUrl: string;
   private credentials: AlexaCookieCredentials | null = null;
+  private cachedCustomerId: string | null = null;
 
   constructor(region: AlexaApiRegion = 'NA') {
     this.baseUrl = ALEXA_API_BASE_URLS[region];
@@ -100,6 +102,7 @@ export class AlexaApiClient {
 
   setCredentials(credentials: AlexaCookieCredentials): void {
     this.credentials = credentials;
+    this.cachedCustomerId = null; // Reset on credential change
 
     // Auto-extract CSRF from the cookie string if not explicitly set
     if (!credentials.csrf) {
@@ -116,6 +119,32 @@ export class AlexaApiClient {
 
   hasValidCredentials(): boolean {
     return this.credentials !== null && this.credentials.cookie.length > 0;
+  }
+
+  /**
+   * Fetch the Amazon customer ID for the authenticated account.
+   * Caches the result so subsequent calls don't make additional requests.
+   * Required for behaviors/preview command payloads.
+   */
+  async getCustomerId(): Promise<string> {
+    if (this.cachedCustomerId) return this.cachedCustomerId;
+
+    this.requireCredentials();
+    try {
+      const response = await this.request('GET', '/api/bootstrap');
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        const data = JSON.parse(response.data);
+        const id = data?.authentication?.customerId;
+        if (id) {
+          this.cachedCustomerId = id;
+          return id;
+        }
+      }
+    } catch {
+      // Fall through to empty string
+    }
+
+    return '';
   }
 
   // -----------------------------------------------------------------------
@@ -203,18 +232,66 @@ export class AlexaApiClient {
 
     const devices = new Map<string, AccountDevice>();
 
+    // Index to detect when a GraphQL endpoint is really an Echo device.
+    // GraphQL returns Echo devices as ALEXA_VOICE_ENABLED endpoints with their
+    // own endpoint ID, while the Echo REST API returns them by serial number.
+    // We use the serial number from GraphQL to merge both records into one.
+    const serialToEndpointId = new Map<string, string>();
+
     // Normalize GraphQL endpoints (smart home devices, including lights, plugs, etc.)
     for (const ep of endpoints) {
       const id = ep.id ?? ep.endpointId;
       const category = ep.displayCategories?.primary?.value ?? 'UNKNOWN';
       const legacy = ep.legacyAppliance;
+
+      // Skip meta-endpoints that aren't real controllable devices:
+      // - "This Device": routing alias for the currently-active Echo
+      // - SCENE_TRIGGER: virtual scene activators, not physical devices
+      // - ACTIVITY_TRIGGER: routine/activity triggers
+      // - WHA: Whole Home Audio groups (managed separately)
+      const name = ep.friendlyName ?? legacy?.friendlyName ?? '';
+      if (name === 'This Device' || name === 'this device') continue;
+      const HIDDEN_CATEGORIES = ['SCENE_TRIGGER', 'ACTIVITY_TRIGGER', 'WHA'];
+      if (HIDDEN_CATEGORIES.includes(category)) continue;
       const reachability = legacy?.applianceNetworkState?.reachability;
+
+      // Track serial → endpoint mapping for Echo device dedup
+      const serial = ep.serialNumber?.value?.text;
+      if (serial) {
+        serialToEndpointId.set(serial, id);
+      }
 
       // Extract feature names for capabilities
       const featureOps: string[] = [];
       for (const f of ep.features ?? []) {
         for (const op of f.operations ?? []) {
           featureOps.push(op.name);
+        }
+      }
+
+      // Extract Alexa Smart Home interface names from legacy capabilities
+      // (e.g., "Alexa.PowerController", "Alexa.ContactSensor", "Alexa.LockController")
+      const interfaces: string[] = [];
+      const rangeCapabilities: RangeCapabilityConfig[] = [];
+      for (const cap of (legacy as Record<string, unknown>)?.capabilities as Array<{ interfaceName?: string; type?: string; instance?: string; configuration?: Record<string, unknown> }> ?? []) {
+        const iface = cap.interfaceName ?? (cap as Record<string, unknown>).interface as string | undefined;
+        if (iface && !interfaces.includes(iface)) {
+          interfaces.push(iface);
+        }
+
+        // Extract RangeController configuration (min/max/step/unit per instance)
+        if (iface === 'Alexa.RangeController' && cap.instance && cap.configuration) {
+          const supportedRange = cap.configuration.supportedRange as { minimumValue?: number; maximumValue?: number; precision?: number } | undefined;
+          const unitOfMeasure = cap.configuration.unitOfMeasure as string | undefined;
+          if (supportedRange) {
+            rangeCapabilities.push({
+              instance: cap.instance,
+              minimumValue: supportedRange.minimumValue,
+              maximumValue: supportedRange.maximumValue,
+              precision: supportedRange.precision,
+              unitOfMeasure: unitOfMeasure,
+            });
+          }
         }
       }
 
@@ -229,24 +306,64 @@ export class AlexaApiClient {
         capabilities: featureOps.length > 0
           ? featureOps
           : (legacy?.actions ?? []),
+        interfaces,
+        description: legacy?.friendlyDescription,
         groups: groupMembership.get(id) ?? groupMembership.get(legacy?.applianceId ?? ''),
+        entityId: legacy?.entityId,
+        applianceId: legacy?.applianceId,
+        rangeCapabilities: rangeCapabilities.length > 0 ? rangeCapabilities : undefined,
         raw: ep as unknown as Record<string, unknown>,
       });
     }
 
-    // Normalize Echo devices (only add if not already present from GraphQL)
+    // Hidden Echo device families — not real controllable devices:
+    // VOX = "This Device" alias, WHA = Whole Home Audio group,
+    // THIRD_PARTY_AVS_SONOS_BOOTLEG/etc = phantom entries
+    const HIDDEN_ECHO_FAMILIES = ['VOX', 'WHA', 'THIRD_PARTY_AVS_SONOS_BOOTLEG'];
+    const HIDDEN_ECHO_NAMES = ['This Device', 'this device'];
+
+    // Normalize Echo devices — merge into existing GraphQL entry when possible,
+    // otherwise add as a new device.
     for (const echo of echoDevices) {
       const id = echo.serialNumber;
-      if (!devices.has(id)) {
+      const family = echo.deviceFamily ?? '';
+      const echoName = echo.accountName ?? echo.deviceTypeFriendlyName ?? '';
+
+      // Skip hidden devices
+      if (HIDDEN_ECHO_FAMILIES.includes(family)) continue;
+      if (HIDDEN_ECHO_NAMES.includes(echoName)) continue;
+
+      const existingEndpointId = serialToEndpointId.get(id);
+
+      if (existingEndpointId && devices.has(existingEndpointId)) {
+        // This Echo device already appeared in GraphQL as an ALEXA_VOICE_ENABLED
+        // endpoint. Merge Echo-specific data into the existing entry so we get
+        // one device with both the smart-home entityId AND the Echo serial/type.
+        const existing = devices.get(existingEndpointId)!;
+        existing.source = 'echo';
+        existing.deviceType = echo.deviceFamily ?? existing.deviceType;
+        existing.alexaDeviceType = echo.deviceType;
+        existing.online = echo.online;
+        existing.model = existing.model ?? echo.deviceTypeFriendlyName;
+        // Use the serial number as ID so commands route correctly
+        devices.delete(existingEndpointId);
+        existing.id = id;
+        devices.set(id, existing);
+      } else if (!devices.has(id)) {
         devices.set(id, {
           id,
           name: echo.accountName ?? echo.deviceTypeFriendlyName ?? id,
           source: 'echo',
-          deviceType: echo.deviceFamily ?? echo.deviceType ?? 'ECHO',
+          // deviceFamily ('ECHO', 'KNIGHT') is the display category;
+          // echo.deviceType ('A3S5BH2HU6VAYF') is the product code needed by the API
+          deviceType: echo.deviceFamily ?? 'ECHO',
+          alexaDeviceType: echo.deviceType,
           online: echo.online,
           manufacturer: 'Amazon',
           model: echo.deviceTypeFriendlyName,
           capabilities: echo.capabilities ?? [],
+          interfaces: [],
+          description: echo.deviceTypeFriendlyName,
           groups: groupMembership.get(id),
           raw: echo as unknown as Record<string, unknown>,
         });
@@ -257,8 +374,8 @@ export class AlexaApiClient {
   }
 
   /**
-   * Send a command to a device via the behaviors/operation API.
-   * POST /api/behaviors/operation
+   * Send a command to a device via the behaviors/preview API.
+   * POST /api/behaviors/preview
    */
   async sendCommand(params: {
     deviceId: string;
@@ -268,7 +385,9 @@ export class AlexaApiClient {
   }): Promise<void> {
     this.requireCredentials();
 
-    const node = this.buildSequenceNode(params);
+    // Auto-fetch customerId if not provided
+    const ownerCustomerId = params.ownerCustomerId || await this.getCustomerId();
+    const node = this.buildSequenceNode({ ...params, ownerCustomerId });
     const payload = JSON.stringify({
       behaviorId: 'PREVIEW',
       sequenceJson: JSON.stringify({
@@ -278,7 +397,7 @@ export class AlexaApiClient {
       status: 'ENABLED',
     });
 
-    const response = await this.request('POST', '/api/behaviors/operation', payload);
+    const response = await this.request('POST', '/api/behaviors/preview', payload);
 
     if (response.statusCode >= 400) {
       throw new Error(
@@ -288,19 +407,122 @@ export class AlexaApiClient {
   }
 
   /**
+   * Send a command to a smart home device via the behaviors/preview API
+   * using the Alexa.SmartHome.Batch format.
+   *
+   * This works for smart home devices (lights, plugs, thermostats, etc.)
+   * that are identified by entity IDs, as opposed to `sendCommand()` which
+   * only works for Echo devices identified by serial numbers.
+   *
+   * POST /api/behaviors/preview
+   */
+  async sendSmartHomeCommand(params: {
+    entityId: string;
+    command: AccountDeviceCommand;
+    ownerCustomerId?: string;
+  }): Promise<void> {
+    this.requireCredentials();
+
+    const operations = this.mapCommandToSmartHomeOperations(params.command);
+    if (!operations) {
+      throw new Error(
+        `Command '${params.command.action}' is not supported for smart home devices. ` +
+        `Only power, brightness, color, color temperature, thermostat, and volume are supported.`,
+      );
+    }
+
+    // Auto-fetch customerId if not provided
+    const customerId = params.ownerCustomerId || await this.getCustomerId();
+
+    const node = {
+      '@type': 'com.amazon.alexa.behaviors.model.OpaquePayloadOperationNode',
+      type: 'Alexa.SmartHome.Batch',
+      skillId: 'amzn1.ask.1p.smarthome',
+      operationPayload: {
+        target: params.entityId,
+        customerId,
+        operations,
+        name: null,
+      },
+    };
+
+    const payload = JSON.stringify({
+      behaviorId: 'PREVIEW',
+      sequenceJson: JSON.stringify({
+        '@type': 'com.amazon.alexa.behaviors.model.Sequence',
+        startNode: node,
+      }),
+      status: 'ENABLED',
+    });
+
+    const response = await this.request('POST', '/api/behaviors/preview', payload);
+
+    if (response.statusCode >= 400) {
+      throw new Error(
+        `Alexa smart home command failed (${response.statusCode}): ${response.data}`,
+      );
+    }
+  }
+
+  /**
+   * Map an AccountDeviceCommand to the Alexa.SmartHome.Batch operations array.
+   * Returns null if the command is not supported for smart home devices.
+   */
+  private mapCommandToSmartHomeOperations(
+    command: AccountDeviceCommand,
+  ): Array<Record<string, unknown>> | null {
+    switch (command.action) {
+      case 'turn_on':
+        return [{ type: 'turnOn' }];
+      case 'turn_off':
+        return [{ type: 'turnOff' }];
+      case 'set_brightness':
+        return [{ type: 'setBrightness', brightness: command.brightness }];
+      case 'set_color':
+        return [{ type: 'setColor', hue: command.color.hue, saturation: command.color.saturation, brightness: command.color.brightness }];
+      case 'set_color_temperature':
+        return [{ type: 'setColorTemperature', colorTemperatureInKelvin: command.colorTemperatureInKelvin }];
+      case 'set_volume':
+        return [{ type: 'setVolume', volumeLevel: command.volume }];
+      case 'set_thermostat':
+        return [{
+          type: 'setTargetTemperature',
+          targetTemperature: {
+            value: command.targetSetpoint.value,
+            scale: command.targetSetpoint.scale,
+          },
+          ...(command.mode ? { thermostatMode: command.mode.value } : {}),
+        }];
+      // speak, play, pause, next, previous are Echo-only commands
+      case 'speak':
+      case 'play':
+      case 'pause':
+      case 'next':
+      case 'previous':
+        return null;
+      default:
+        return null;
+    }
+  }
+
+  /**
    * Poll device states via the phoenix/state API.
    * POST /api/phoenix/state
    *
-   * The entityIds should be `legacyAppliance.entityId` values from GraphQL,
-   * NOT the endpointId. Returns parsed capability states for each device.
+   * The applianceIds must be `legacyAppliance.applianceId` values from GraphQL —
+   * NOT the entityId (UUID) or endpointId (amzn1.alexa.endpoint...), which both
+   * return TargetApplianceNotFoundException.
+   *
+   * @param applianceIds  The applianceId values to poll
+   * @param deviceNameMap Optional map from applianceId → display name
    */
   async getDeviceStates(
-    entityIds: string[],
+    applianceIds: string[],
     deviceNameMap?: Map<string, string>,
   ): Promise<DeviceStateSnapshot[]> {
     this.requireCredentials();
 
-    const stateRequests = entityIds.map((entityId) => ({
+    const stateRequests = applianceIds.map((entityId) => ({
       entityId,
       entityType: 'APPLIANCE',
     }));
@@ -312,6 +534,7 @@ export class AlexaApiClient {
     const polledAt = new Date().toISOString();
     const snapshots: DeviceStateSnapshot[] = [];
 
+    // Process successful device states
     for (const ds of data.deviceStates ?? []) {
       const deviceId = ds.entity?.entityId;
       if (!deviceId) continue;
@@ -332,12 +555,16 @@ export class AlexaApiClient {
       for (const raw of ds.capabilityStates ?? []) {
         try {
           const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-          capabilities.push({
+          const cap: ParsedCapabilityState = {
             namespace: parsed.namespace ?? '',
             name: parsed.name ?? '',
             value: parsed.value,
             timeOfSample: parsed.timeOfSample,
-          });
+          };
+          if (parsed.instance) {
+            cap.instance = parsed.instance;
+          }
+          capabilities.push(cap);
         } catch {
           // Skip malformed capability states
         }
@@ -348,6 +575,22 @@ export class AlexaApiClient {
         deviceName: deviceNameMap?.get(deviceId),
         capabilities,
         polledAt,
+      });
+    }
+
+    // Process top-level errors (devices that couldn't be queried at all)
+    for (const err of data.errors ?? []) {
+      const deviceId = err.entity?.entityId;
+      if (!deviceId) continue;
+      // Skip "not found" errors silently — these are expected for devices
+      // that don't support state queries (e.g. Echo devices, buttons)
+      if (err.code === 'TargetApplianceNotFoundException') continue;
+      snapshots.push({
+        deviceId,
+        deviceName: deviceNameMap?.get(deviceId),
+        capabilities: [],
+        polledAt,
+        error: `${err.code}: ${err.message ?? 'unknown'}`,
       });
     }
 
@@ -382,7 +625,30 @@ export class AlexaApiClient {
       body,
       { baseUrl: 'https://www.amazon.com' },
     );
-    const data = this.parseJsonResponse(response) as ActivityHistoryResponse;
+
+    // The privacy endpoint on www.amazon.com may return HTML instead of JSON
+    // if the cookie doesn't cover the www.amazon.com domain. Provide a clear
+    // error message instead of a generic JSON parse failure.
+    if (response.statusCode >= 300) {
+      const snippet = response.data.substring(0, 200);
+      throw new Error(
+        `Activity history endpoint returned ${response.statusCode}. ` +
+        (response.data.includes('<html') || response.data.includes('<!DOCTYPE')
+          ? 'Received HTML (likely a login redirect). The cookie may not cover www.amazon.com. '
+            + 'Try re-extracting cookies after visiting www.amazon.com/alexa-privacy.'
+          : snippet),
+      );
+    }
+
+    let data: ActivityHistoryResponse;
+    try {
+      data = JSON.parse(response.data) as ActivityHistoryResponse;
+    } catch {
+      throw new Error(
+        'Activity history returned non-JSON. The cookie may not cover www.amazon.com. '
+        + `Response starts with: ${response.data.substring(0, 100)}`,
+      );
+    }
 
     const records: ActivityRecord[] = [];
     for (const entry of data.customerHistoryRecords ?? []) {
@@ -449,8 +715,12 @@ export class AlexaApiClient {
   }): Record<string, unknown> {
     const { deviceId, deviceType, command, ownerCustomerId } = params;
 
-    const baseNode = {
+    // The `type` field is a sibling of `operationPayload` on the node object,
+    // NOT inside operationPayload. This matches the format used by Apollon77/
+    // alexa-remote, thorsten-gehrig/alexa-remote-control, and aioamazondevices.
+    const baseNode: Record<string, unknown> = {
       '@type': 'com.amazon.alexa.behaviors.model.OpaquePayloadOperationNode',
+      type: '',
       operationPayload: {} as Record<string, unknown>,
     };
 
@@ -462,37 +732,41 @@ export class AlexaApiClient {
 
     switch (command.action) {
       case 'turn_on':
+        baseNode.type = 'Alexa.DeviceControls.Power';
         baseNode.operationPayload = {
-          type: 'Alexa.DeviceControls.Power',
           deviceType,
           deviceSerialNumber: deviceId,
+          customerId: ownerCustomerId ?? '',
           action: 'turnOn',
         };
         break;
 
       case 'turn_off':
+        baseNode.type = 'Alexa.DeviceControls.Power';
         baseNode.operationPayload = {
-          type: 'Alexa.DeviceControls.Power',
           deviceType,
           deviceSerialNumber: deviceId,
+          customerId: ownerCustomerId ?? '',
           action: 'turnOff',
         };
         break;
 
       case 'set_brightness':
+        baseNode.type = 'Alexa.DeviceControls.Brightness';
         baseNode.operationPayload = {
-          type: 'Alexa.DeviceControls.Brightness',
           deviceType,
           deviceSerialNumber: deviceId,
+          customerId: ownerCustomerId ?? '',
           brightness: command.brightness,
         };
         break;
 
       case 'set_color':
+        baseNode.type = 'Alexa.DeviceControls.Color';
         baseNode.operationPayload = {
-          type: 'Alexa.DeviceControls.Color',
           deviceType,
           deviceSerialNumber: deviceId,
+          customerId: ownerCustomerId ?? '',
           colorName: undefined,
           hue: command.color.hue,
           saturation: command.color.saturation,
@@ -501,28 +775,32 @@ export class AlexaApiClient {
         break;
 
       case 'set_color_temperature':
+        baseNode.type = 'Alexa.DeviceControls.ColorTemperature';
         baseNode.operationPayload = {
-          type: 'Alexa.DeviceControls.ColorTemperature',
           deviceType,
           deviceSerialNumber: deviceId,
+          customerId: ownerCustomerId ?? '',
           colorTemperatureInKelvin: command.colorTemperatureInKelvin,
         };
         break;
 
       case 'set_volume':
+        baseNode.type = 'Alexa.DeviceControls.Volume';
         baseNode.operationPayload = {
-          type: 'Alexa.DeviceControls.Volume',
           deviceType,
           deviceSerialNumber: deviceId,
-          volumeLevel: command.volume,
+          customerId: ownerCustomerId ?? '',
+          locale: 'en-US',
+          value: command.volume,
         };
         break;
 
       case 'set_thermostat':
+        baseNode.type = 'Alexa.DeviceControls.ThermostatTemperature';
         baseNode.operationPayload = {
-          type: 'Alexa.DeviceControls.ThermostatTemperature',
           deviceType,
           deviceSerialNumber: deviceId,
+          customerId: ownerCustomerId ?? '',
           targetTemperature: {
             value: command.targetSetpoint.value,
             scale: command.targetSetpoint.scale,
@@ -532,42 +810,49 @@ export class AlexaApiClient {
         break;
 
       case 'speak':
+        baseNode.type = 'Alexa.Speak';
         baseNode.operationPayload = {
-          type: 'Alexa.Speak',
+          deviceType,
+          deviceSerialNumber: deviceId,
+          customerId: ownerCustomerId ?? '',
+          locale: 'en-US',
           textToSpeak: command.text,
-          target: deviceTarget,
         };
         break;
 
       case 'play':
+        baseNode.type = 'Alexa.Media.Play';
         baseNode.operationPayload = {
-          type: 'Alexa.Media.Play',
           deviceType,
           deviceSerialNumber: deviceId,
+          customerId: ownerCustomerId ?? '',
         };
         break;
 
       case 'pause':
+        baseNode.type = 'Alexa.Media.Pause';
         baseNode.operationPayload = {
-          type: 'Alexa.Media.Pause',
           deviceType,
           deviceSerialNumber: deviceId,
+          customerId: ownerCustomerId ?? '',
         };
         break;
 
       case 'next':
+        baseNode.type = 'Alexa.Media.Next';
         baseNode.operationPayload = {
-          type: 'Alexa.Media.Next',
           deviceType,
           deviceSerialNumber: deviceId,
+          customerId: ownerCustomerId ?? '',
         };
         break;
 
       case 'previous':
+        baseNode.type = 'Alexa.Media.Previous';
         baseNode.operationPayload = {
-          type: 'Alexa.Media.Previous',
           deviceType,
           deviceSerialNumber: deviceId,
+          customerId: ownerCustomerId ?? '',
         };
         break;
 
@@ -641,16 +926,33 @@ export class AlexaApiClient {
         ? 'AmazonWebView/AmazonAlexa/2.2.663733.0/iOS/18.5/iPhone'
         : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36';
 
+      // When making cross-domain requests (e.g. www.amazon.com for activity
+      // history), Origin/Referer must match the target host or Amazon rejects
+      // the request with a CSRF / 403 error.
+      const effectiveBase = opts?.baseUrl ?? this.baseUrl;
+
       const headers: Record<string, string> = {
         Cookie: this.credentials!.cookie,
         'User-Agent': userAgent,
         Accept: 'application/json',
         'Accept-Language': 'en-US',
-        Origin: this.baseUrl,
-        Referer: `${this.baseUrl}/spa/index.html`,
+        Origin: effectiveBase,
+        Referer: `${effectiveBase}/`,
       };
 
-      if (this.credentials!.csrf) {
+      // CSRF handling depends on the target domain:
+      // - alexa.amazon.com uses a custom 'csrf' header
+      // - www.amazon.com uses the 'anti-csrftoken-a2z' cookie value as a header
+      const isCrossDomain = opts?.baseUrl && !opts.baseUrl.includes('alexa.amazon');
+      if (isCrossDomain) {
+        // Extract anti-csrftoken-a2z from the cookie string for www.amazon.com
+        const csrfMatch = this.credentials!.cookie.match(
+          /anti-csrftoken-a2z=([^;]+)/,
+        );
+        if (csrfMatch) {
+          headers['anti-csrftoken-a2z'] = csrfMatch[1];
+        }
+      } else if (this.credentials!.csrf) {
         headers['csrf'] = this.credentials!.csrf;
       }
 

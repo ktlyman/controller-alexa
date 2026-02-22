@@ -37,6 +37,7 @@ export type AgentAction =
   | ControlAccountDeviceAction
   | PollDeviceStateAction
   | PollAllStatesAction
+  | GetCachedStatesAction
   | GetActivityHistoryAction
   | QueryStateHistoryAction
   | StartPushListenerAction
@@ -136,30 +137,42 @@ export interface ListAllDevicesAction {
 
 export interface ControlAccountDeviceAction {
   type: 'control_account_device';
-  /** The device ID (entityId or serialNumber) */
+  /** The device ID (endpointId or serialNumber) */
   deviceId: string;
-  /** The device type (needed for the behaviors API) */
+  /** The device type (display category, e.g., 'ECHO', 'LIGHT') */
   deviceType: string;
   /** The command to execute */
   command: AccountDeviceCommand;
+  /** Device source: 'smart_home' uses SmartHome.Batch, 'echo' uses behaviors API */
+  source?: 'smart_home' | 'echo';
+  /** Legacy appliance entityId (for smart home devices) */
+  entityId?: string;
+  /** Alexa product type code (e.g. 'A3S5BH2HU6VAYF') — needed for Echo behaviors API */
+  alexaDeviceType?: string;
 }
 
 // -- State polling & activity history actions -------------------------------
 
 export interface PollDeviceStateAction {
   type: 'poll_device_state';
-  /** The entityId (legacyAppliance.entityId from GraphQL) to poll */
+  /** @deprecated Use applianceId instead. The entityId (UUID) format does not work with phoenix API. */
   entityId: string;
+  /** The applianceId (legacyAppliance.applianceId from GraphQL) — the only ID format phoenix/state accepts */
+  applianceId?: string;
   /** Optional human-readable name for the snapshot */
   deviceName?: string;
 }
 
 export interface PollAllStatesAction {
   type: 'poll_all_states';
-  /** Specific entityIds to poll; if omitted, auto-discovers from GraphQL */
+  /** Specific applianceIds to poll; if omitted, auto-discovers from GraphQL */
   entityIds?: string[];
   /** Number of devices per batch (default 10) */
   batchSize?: number;
+}
+
+export interface GetCachedStatesAction {
+  type: 'get_cached_states';
 }
 
 export interface GetActivityHistoryAction {
@@ -259,6 +272,7 @@ export type ListAllDevicesResult = { devices: AccountDevice[]; deviceCount: numb
 export type ControlAccountDeviceResult = { acknowledged: boolean };
 export type PollDeviceStateResult = { state: DeviceStateSnapshot };
 export type PollAllStatesResult = { states: DeviceStateSnapshot[]; polledCount: number; errorCount: number };
+export type GetCachedStatesResult = { states: DeviceStateSnapshot[]; stateCount: number; cachedAt?: string };
 export type GetActivityHistoryResult = { records: ActivityRecord[]; recordCount: number; nextToken?: string };
 export type QueryStateHistoryResult = { snapshots: DeviceStateSnapshot[]; totalCount: number };
 export type StartPushListenerResult = { status: 'connected' | 'already_connected'; connectionId: string };
