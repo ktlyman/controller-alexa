@@ -634,11 +634,20 @@ export class AlexaAgentTool {
     // Only poll smart_home devices — Echo-source devices don't support
     // phoenix/state queries and would all return ENDPOINT_UNREACHABLE.
     const nameMap = new Map<string, string>();
+    // Echo devices: dsn → { name, applianceId? } so we can store volume snapshots
+    // under the same key the frontend uses for state lookup (applianceId || id)
+    const echoDeviceInfo = new Map<string, { name: string; stateKey: string }>();
     let ids = entityIds;
     if (!ids || ids.length === 0) {
       const devices = await this.alexaApi.getAllDevices();
       ids = [];
       for (const d of devices) {
+        if (d.source === 'echo') {
+          echoDeviceInfo.set(d.id, {
+            name: d.name,
+            stateKey: d.applianceId || d.id,
+          });
+        }
         const aid = d.applianceId;
         if (aid && d.source === 'smart_home') {
           ids.push(aid);
@@ -647,15 +656,14 @@ export class AlexaAgentTool {
       }
     }
 
-    if (ids.length === 0) {
+    if (ids.length === 0 && echoDeviceInfo.size === 0) {
       return { states: [], polledCount: 0, errorCount: 0 };
     }
 
     const allSnapshots: import('../alexa-api/alexa-api-types').DeviceStateSnapshot[] = [];
     let errorCount = 0;
 
-    // Process in batches — the phoenix API handles large batches well,
-    // so we use a large batch size (50) with a short delay between batches.
+    // Process smart home devices in batches via phoenix/state API
     for (let i = 0; i < ids.length; i += batchSize) {
       if (i > 0) {
         await new Promise((resolve) => setTimeout(resolve, 200));
@@ -677,6 +685,43 @@ export class AlexaAgentTool {
           });
           errorCount++;
         }
+      }
+    }
+
+    // Fetch Echo device volumes via the dedicated volume API.
+    // The phoenix/state API doesn't return Alexa.Speaker for Echo devices,
+    // so this is the only way to get real volume levels.
+    if (echoDeviceInfo.size > 0) {
+      try {
+        const volumes = await this.alexaApi.getAllDeviceVolumes();
+        const polledAt = new Date().toISOString();
+        for (const vol of volumes) {
+          // Only create snapshots for Echo devices we know about
+          const info = echoDeviceInfo.get(vol.dsn);
+          if (!info) continue;
+          allSnapshots.push({
+            // Use the same key the frontend uses for state lookup (applianceId || id)
+            deviceId: info.stateKey,
+            deviceName: info.name,
+            capabilities: [
+              {
+                namespace: 'Alexa.Speaker',
+                name: 'volume',
+                value: vol.speakerVolume,
+                timeOfSample: polledAt,
+              },
+              {
+                namespace: 'Alexa.Speaker',
+                name: 'muted',
+                value: vol.speakerMuted,
+                timeOfSample: polledAt,
+              },
+            ],
+            polledAt,
+          });
+        }
+      } catch {
+        // Volume fetch is best-effort — don't fail the whole poll
       }
     }
 

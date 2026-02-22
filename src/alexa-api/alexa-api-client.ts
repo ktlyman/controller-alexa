@@ -610,6 +610,38 @@ export class AlexaApiClient {
   }
 
   /**
+   * Fetch current volume levels for all Echo devices on the account.
+   * GET /api/devices/deviceType/dsn/audio/v1/allDeviceVolumes
+   *
+   * Returns an array of { dsn, deviceType, speakerVolume, speakerMuted } entries.
+   * This is the only way to get volume — the Phoenix state API doesn't return
+   * Alexa.Speaker data for Echo devices.
+   */
+  async getAllDeviceVolumes(): Promise<
+    Array<{ dsn: string; deviceType: string; speakerVolume: number; speakerMuted: boolean }>
+  > {
+    this.requireCredentials();
+    const response = await this.request(
+      'GET',
+      '/api/devices/deviceType/dsn/audio/v1/allDeviceVolumes',
+    );
+    const data = this.parseJsonResponse(response) as {
+      volumes?: Array<{
+        dsn?: string;
+        deviceType?: string;
+        speakerVolume?: number;
+        speakerMuted?: boolean;
+      }>;
+    };
+    return (data.volumes ?? []).map((v) => ({
+      dsn: v.dsn ?? '',
+      deviceType: v.deviceType ?? '',
+      speakerVolume: v.speakerVolume ?? 0,
+      speakerMuted: v.speakerMuted ?? false,
+    }));
+  }
+
+  /**
    * Fetch voice activity history from the privacy endpoint.
    * POST https://www.amazon.com/alexa-privacy/apd/rvh/customer-history-records-v2
    *
