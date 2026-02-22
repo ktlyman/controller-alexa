@@ -283,6 +283,17 @@ export class AlexaApiClient {
         if (iface === 'Alexa.RangeController' && cap.instance && cap.configuration) {
           const supportedRange = cap.configuration.supportedRange as { minimumValue?: number; maximumValue?: number; precision?: number } | undefined;
           const unitOfMeasure = cap.configuration.unitOfMeasure as string | undefined;
+
+          // Extract semantic name from resources.friendlyNames
+          // Can be an assetId like "Alexa.AirQuality.Humidity" or plain text like "Particulate matter PM10"
+          let friendlyName: string | undefined;
+          const capAny = cap as Record<string, unknown>;
+          const resources = capAny.resources as { friendlyNames?: Array<{ value?: { assetId?: string; text?: string }; '@type'?: string }> } | undefined;
+          if (resources?.friendlyNames?.[0]) {
+            const fn = resources.friendlyNames[0];
+            friendlyName = fn.value?.assetId ?? fn.value?.text;
+          }
+
           if (supportedRange) {
             rangeCapabilities.push({
               instance: cap.instance,
@@ -290,6 +301,7 @@ export class AlexaApiClient {
               maximumValue: supportedRange.maximumValue,
               precision: supportedRange.precision,
               unitOfMeasure: unitOfMeasure,
+              friendlyName,
             });
           }
         }

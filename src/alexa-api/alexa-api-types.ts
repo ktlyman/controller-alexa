@@ -192,6 +192,8 @@ export interface RangeCapabilityConfig {
   maximumValue?: number;
   precision?: number;
   unitOfMeasure?: string;
+  /** Semantic name from resources.friendlyNames (e.g. 'Alexa.AirQuality.Humidity', 'Particulate matter PM10') */
+  friendlyName?: string;
 }
 
 // ---------------------------------------------------------------------------

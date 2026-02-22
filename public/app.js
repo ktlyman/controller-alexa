@@ -913,7 +913,32 @@ function renderDeviceCard(d) {
 }
 
 /** Map a RangeController instance name to a display icon, label, and unit. */
-function rangeInstanceInfo(instLower, instRaw) {
+function rangeInstanceInfo(instLower, instRaw, friendlyName) {
+  // First check the semantic friendlyName from discovery (Alexa asset IDs or text)
+  // This is the most reliable since instance strings can be opaque numeric IDs
+  if (friendlyName) {
+    const fn = friendlyName.toLowerCase();
+    if (fn.includes('humidity')) return { icon: '\u{1F4A7}', label: 'Humidity', unit: '%' };
+    if (fn.includes('particulatematter') || fn.includes('particulate_matter') || fn.includes('particulate matter')) {
+      // Distinguish PM2.5 from PM10 by checking semantics or unit
+      if (fn.includes('pm10') || fn.includes('pm_10')) return { icon: '\u{1F32B}\uFE0F', label: 'PM10', unit: ' \u00B5g/m\u00B3' };
+      return { icon: '\u{1F32B}\uFE0F', label: 'PM2.5', unit: ' \u00B5g/m\u00B3' };
+    }
+    if (fn.includes('pm10') || fn.includes('pm_10')) return { icon: '\u{1F32B}\uFE0F', label: 'PM10', unit: ' \u00B5g/m\u00B3' };
+    if (fn.includes('pm2') || fn.includes('pm25') || fn.includes('pm_2')) return { icon: '\u{1F32B}\uFE0F', label: 'PM2.5', unit: ' \u00B5g/m\u00B3' };
+    if (fn.includes('volatileorganiccompounds') || fn.includes('volatile_organic') || fn.includes('voc'))
+      return { icon: '\u{1F343}', label: 'VOC', unit: ' idx' };
+    if (fn.includes('carbondioxide') || fn.includes('carbon_dioxide') || fn.includes('co2'))
+      return { icon: '\u{2601}\uFE0F', label: 'CO\u2082', unit: ' ppm' };
+    if (fn.includes('carbonmonoxide') || fn.includes('carbon_monoxide'))
+      return { icon: '\u{26A0}\uFE0F', label: 'CO', unit: ' ppm' };
+    if (fn.includes('indoorairquality') || fn.includes('indoor_air_quality') || fn.includes('airquality') || fn.includes('air_quality') || fn.includes('iaq'))
+      return { icon: '\u{1F3AF}', label: 'IAQ', unit: '' };
+    if (fn.includes('temperature') || fn.includes('temp'))
+      return { icon: '\u{1F321}\uFE0F', label: 'Temp', unit: '\u00B0' };
+  }
+
+  // Fall back to matching the instance string directly (for devices with descriptive instance names)
   if (instLower.includes('humidity')) return { icon: '\u{1F4A7}', label: 'Humidity', unit: '%' };
   if (instLower.includes('pm2') || instLower.includes('pm25') || instLower === 'pm2.5')
     return { icon: '\u{1F32B}\uFE0F', label: 'PM2.5', unit: ' \u00B5g/m\u00B3' };
@@ -1006,9 +1031,9 @@ function renderCardBody(d, snapshot) {
       const inst = rc.instance.toLowerCase();
       const val = (rc.value !== null && rc.value !== undefined) ? rc.value : null;
       if (val === null) continue;
-      const info = rangeInstanceInfo(inst, rc.instance);
-      // Get range config from the device discovery data for min/max context
+      // Get range config from the device discovery data for min/max context and friendlyName
       const rangeConfig = (d.rangeCapabilities || []).find(rc2 => rc2.instance === rc.instance);
+      const info = rangeInstanceInfo(inst, rc.instance, rangeConfig && rangeConfig.friendlyName);
       const rangeHint = rangeConfig && rangeConfig.maximumValue != null
         ? ` <span class="sensor-range">/ ${rangeConfig.maximumValue}</span>` : '';
       sensorItems.push(`<div class="sensor-reading">
@@ -1616,9 +1641,9 @@ function renderReadableState(snapshot, device) {
   for (const rc of rangeCaps) {
     const val = rc.value;
     if (val === null || val === undefined) continue;
-    const info = rangeInstanceInfo(rc.instance.toLowerCase(), rc.instance);
     // Include range config (min/max) from discovery
     const rangeConfig = device && (device.rangeCapabilities || []).find(r => r.instance === rc.instance);
+    const info = rangeInstanceInfo(rc.instance.toLowerCase(), rc.instance, rangeConfig && rangeConfig.friendlyName);
     const rangeStr = rangeConfig && rangeConfig.maximumValue != null
       ? ` <span class="readable-range">(${rangeConfig.minimumValue ?? 0}–${rangeConfig.maximumValue})</span>` : '';
     const sampleAge = rc.timeOfSample ? ` <span class="readable-age">${formatSampleAge(rc.timeOfSample)}</span>` : '';
@@ -1690,7 +1715,8 @@ async function loadDeviceHistory(deviceId, device) {
         if (cap.namespace === 'Alexa.RangeController' && cap.instance && cap.value != null) {
           const key = 'range-' + cap.instance;
           if (!trackedKeys.has(key)) {
-            const info = rangeInstanceInfo(cap.instance.toLowerCase(), cap.instance);
+            const rc = device && (device.rangeCapabilities || []).find(r => r.instance === cap.instance);
+            const info = rangeInstanceInfo(cap.instance.toLowerCase(), cap.instance, rc && rc.friendlyName);
             trackedKeys.set(key, { label: info.label, icon: info.icon, unit: info.unit, values: [] });
           }
           trackedKeys.get(key).values.push({ time: s.polledAt, value: Number(cap.value) });
